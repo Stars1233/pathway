@@ -139,8 +139,14 @@ where
     D: ExchangeData,
     R: ExchangeData,
 {
-    let serialized_data = backend.get_value(&chunk.to_string())?;
-    deserialize(&serialized_data).map_err(|err| BackendError::Bincode(*err))
+    let key = chunk.to_string();
+    let serialized_data = backend.get_value(&key)?;
+    let size = serialized_data.len();
+    deserialize(&serialized_data).map_err(|err| BackendError::ChunkDeserialization {
+        chunk: key,
+        size,
+        source: *err,
+    })
 }
 
 fn read_chunks<D, R>(

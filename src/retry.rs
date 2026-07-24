@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use log::error;
+use log::{error, warn};
 use rand::{rng, Rng};
 
 const DEFAULT_SLEEP_INITIAL_DURATION: Duration = Duration::from_secs(1);
@@ -108,11 +108,13 @@ where
     P: FnMut(&E) -> bool,
 {
     let mut exec_result = func().await;
-    for _ in 0..max_retries {
+    for n_attempt in 0..max_retries {
         match exec_result {
             Ok(_) => return exec_result,
             Err(ref e) if !should_retry(e) => return exec_result,
-            Err(_) => {}
+            // A retried attempt that eventually succeeds leaves no trace
+            // otherwise, which hides a flaky backend behind a later failure.
+            Err(ref e) => warn!("Attempt {n_attempt} failed, retrying: {e:?}"),
         }
         retry_config.sleep_after_error_async().await;
         exec_result = func().await;

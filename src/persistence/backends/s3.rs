@@ -83,12 +83,34 @@ impl PersistenceBackend for S3KVStorage {
 
     fn get_value(&self, key: &str) -> Result<Vec<u8>, Error> {
         let full_key_path = self.full_key_path(key);
-        let response_data = self.runtime.block_on(execute_with_retries_async(
-            async || self.bucket.get_object(&full_key_path).await, // returns Err on incorrect status code because fail-on-err feature is enabled
+        let value = self.runtime.block_on(execute_with_retries_async(
+            async || -> Result<Vec<u8>, Error> {
+                // `fail-on-err` only inspects the status code, so a body that
+                // ends early still arrives as a successful response and would
+                // pass for the whole object - to surface much later, as data
+                // that can't be deserialized. Comparing it against the length
+                // the response announced turns that into a retryable error.
+                let response = self.bucket.get_object(&full_key_path).await?;
+                let announced_len = response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok());
+                let value = response.bytes().to_vec();
+                if let Some(expected) = announced_len {
+                    if value.len() != expected {
+                        return Err(Error::TruncatedResponse {
+                            key: full_key_path.clone(),
+                            expected,
+                            actual: value.len(),
+                        });
+                    }
+                }
+                Ok(value)
+            },
             RetryConfig::default(),
             MAX_S3_RETRIES,
         ))?;
-        Ok(response_data.bytes().to_vec())
+        Ok(value)
     }
 
     fn put_value(&self, key: &str, value: Vec<u8>) -> BackendPutFuture {

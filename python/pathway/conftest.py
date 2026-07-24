@@ -14,7 +14,7 @@ from pathway.internals import config, parse_graph
 from pathway.tests.utils import (
     AIRBYTE_FAKER_CONNECTION_REL_PATH,
     SerializationTestHelper,
-    UniquePortDispenser,
+    make_port_fixture,
 )
 
 
@@ -76,15 +76,8 @@ def pytest_runtest_teardown(item: pytest.Item) -> None:
     assert saved_env == new_env, "environment changed during the test run"
 
 
-# FIXME: if you plan to use more than 16 pathway processes, increase the step size
-PORT_DISPENSER = UniquePortDispenser(
-    step_size=16,
-)
-
-
-@pytest.fixture
-def port(testrun_uid):
-    yield PORT_DISPENSER.get_unique_port(testrun_uid)
+# FIXME: if you plan to use more than 16 pathway processes, increase the block size
+port = make_port_fixture(block_size=16)
 
 
 @pytest.fixture

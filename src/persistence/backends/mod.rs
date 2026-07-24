@@ -68,6 +68,23 @@ pub enum Error {
 
     #[error("metadata entry {0:?} incorrectly formatted: {1}")]
     IncorrectMetadataFormat(String, #[source] JsonParseError),
+
+    // Without the chunk name and its size, a truncated chunk and a chunk that
+    // was overwritten by unrelated data look exactly the same downstream.
+    #[error("snapshot chunk {chunk:?} of {size} bytes can't be deserialized: {source}")]
+    ChunkDeserialization {
+        chunk: String,
+        size: usize,
+        #[source]
+        source: BincodeError,
+    },
+
+    #[error("the body of {key:?} holds {actual} bytes while {expected} were announced")]
+    TruncatedResponse {
+        key: String,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 pub type BackendPutFuture = OneShotReceiver<Result<(), Error>>;
