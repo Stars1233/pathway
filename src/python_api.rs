@@ -142,11 +142,11 @@ use crate::connectors::data_storage::{
     ChromaWriter, ClickHouseWriter, ConnectorMode, DeltaError, DeltaTableReader, DuckDbWriter,
     ElasticSearchWriter, FileWriter, IcebergReader, KafkaReader, KafkaWriter, LakeWriter,
     MessageQueueTopic, MongoReader, MongoWriter, MqttReader, MqttWriter, MssqlReader, NatsReader,
-    NatsWriter, NullWriter, ObjectDownloader, PsqlReader, PsqlWriter, PulsarReader, PulsarWriter,
-    PythonConnectorEventType, PythonReaderBuilder, QdrantWriter, QuestDBAtColumnPolicy,
-    QuestDBWriter, RabbitmqReader, RabbitmqWriter, ReadError, ReadMethod, ReaderBuilder,
-    SqliteReader, SqliteWriter, TableContext, TableWriterInitMode, WeaviateWriter, WriteError,
-    Writer, MQTT_CLIENT_MAX_CHANNEL_SIZE,
+    NatsWriter, NullWriter, ObjectDownloader, PsqlReader, PsqlWriter, PulsarDeliverySchedule,
+    PulsarReader, PulsarWriter, PythonConnectorEventType, PythonReaderBuilder, QdrantWriter,
+    QuestDBAtColumnPolicy, QuestDBWriter, RabbitmqReader, RabbitmqWriter, ReadError, ReadMethod,
+    ReaderBuilder, SqliteReader, SqliteWriter, TableContext, TableWriterInitMode, WeaviateWriter,
+    WriteError, Writer, MQTT_CLIENT_MAX_CHANNEL_SIZE,
 };
 use crate::connectors::data_tokenize::{BufReaderTokenizer, CsvTokenizer, Tokenize};
 use crate::connectors::posix_like::PosixLikeReader;
@@ -5196,6 +5196,7 @@ pub struct PulsarSettings {
     read_compacted: bool,
     producer_name: Option<String>,
     event_time_from_engine: bool,
+    deliver_after_millis: Option<u64>,
 }
 
 #[pymethods]
@@ -5212,6 +5213,7 @@ impl PulsarSettings {
         read_compacted = false,
         producer_name = None,
         event_time_from_engine = false,
+        deliver_after_millis = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -5225,6 +5227,7 @@ impl PulsarSettings {
         read_compacted: bool,
         producer_name: Option<String>,
         event_time_from_engine: bool,
+        deliver_after_millis: Option<u64>,
     ) -> Self {
         Self {
             auth_token,
@@ -5237,6 +5240,7 @@ impl PulsarSettings {
             read_compacted,
             producer_name,
             event_time_from_engine,
+            deliver_after_millis,
         }
     }
 }
@@ -5606,6 +5610,8 @@ pub struct DataStorage {
     key_field_index: Option<usize>,
     ordering_key_field_index: Option<usize>,
     event_time_field_index: Option<usize>,
+    deliver_at_field_index: Option<usize>,
+    deliver_after_field_index: Option<usize>,
     min_commit_frequency: Option<u64>,
     downloader_threads_count: Option<usize>,
     database: Option<String>,
@@ -6200,6 +6206,8 @@ impl DataStorage {
         key_field_index = None,
         ordering_key_field_index = None,
         event_time_field_index = None,
+        deliver_at_field_index = None,
+        deliver_after_field_index = None,
         min_commit_frequency = None,
         downloader_threads_count = None,
         database = None,
@@ -6257,6 +6265,8 @@ impl DataStorage {
         key_field_index: Option<usize>,
         ordering_key_field_index: Option<usize>,
         event_time_field_index: Option<usize>,
+        deliver_at_field_index: Option<usize>,
+        deliver_after_field_index: Option<usize>,
         min_commit_frequency: Option<u64>,
         downloader_threads_count: Option<usize>,
         database: Option<String>,
@@ -6331,6 +6341,8 @@ impl DataStorage {
             key_field_index,
             ordering_key_field_index,
             event_time_field_index,
+            deliver_at_field_index,
+            deliver_after_field_index,
             min_commit_frequency,
             downloader_threads_count,
             database,
@@ -8472,6 +8484,33 @@ impl DataStorage {
         Ok(Box::new(writer))
     }
 
+    /// The delivery schedule of the produced Pulsar messages. The Python
+    /// side validates that at most one of the sources is set.
+    fn pulsar_delivery_schedule(&self) -> PyResult<PulsarDeliverySchedule> {
+        let constant_delay = self
+            .pulsar_settings
+            .as_ref()
+            .and_then(|settings| settings.deliver_after_millis);
+        let sources_set = usize::from(self.deliver_at_field_index.is_some())
+            + usize::from(self.deliver_after_field_index.is_some())
+            + usize::from(constant_delay.is_some());
+        if sources_set > 1 {
+            return Err(PyValueError::new_err(
+                "at most one of deliver_at and deliver_after can be set",
+            ));
+        }
+        if let Some(index) = self.deliver_at_field_index {
+            return Ok(PulsarDeliverySchedule::AtColumn(index));
+        }
+        if let Some(index) = self.deliver_after_field_index {
+            return Ok(PulsarDeliverySchedule::AfterColumn(index));
+        }
+        if let Some(millis) = constant_delay {
+            return Ok(PulsarDeliverySchedule::AfterMillis(millis));
+        }
+        Ok(PulsarDeliverySchedule::Immediate)
+    }
+
     fn construct_pulsar_writer(
         &self,
         license: Option<&License>,
@@ -8496,6 +8535,7 @@ impl DataStorage {
             .pulsar_settings
             .as_ref()
             .is_some_and(|settings| settings.event_time_from_engine);
+        let delivery_schedule = self.pulsar_delivery_schedule()?;
         // The formatter's schema, when it has one, is declared to the
         // broker's registry: the broker validates it against the topic's
         // compatibility policy and versions it, making the topic readable
@@ -8510,6 +8550,7 @@ impl DataStorage {
             self.ordering_key_field_index,
             self.event_time_field_index,
             event_time_from_engine,
+            delivery_schedule,
             compression,
             producer_name,
             declared_avro_schema,

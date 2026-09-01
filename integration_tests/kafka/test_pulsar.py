@@ -3292,6 +3292,509 @@ def test_pulsar_write_rejects_negative_event_time(pulsar_context, tmp_path):
         pw.run()
 
 
+# --- Delayed delivery tests ---
+
+# The delay the scheduled messages are published with. Long enough for the
+# checks that a message is not delivered early to have a window under load,
+# short enough to keep the suite fast.
+DELIVERY_DELAY_SECS = 8
+
+# The horizon the absolute delivery times are scheduled at: far enough for
+# the pipeline to publish the messages before it comes even on a loaded
+# machine, which the checks below rely on.
+DELIVER_AT_HORIZON_SECS = 20
+
+# The broker's delayed-delivery tracker ticks once a second
+# (delayedDeliveryTickTimeMillis) and, in its default non-strict mode
+# (isDelayedDeliveryDeliverAtTimeStrict=false), releases the messages due
+# within the next tick — so a scheduled message may arrive up to a second
+# before its delivery time, and up to a second after it. The tolerance below
+# covers that, together with the small gap between the moment the writer
+# computes a relative delivery time and the moment the broker stamps the
+# publish time.
+DELIVERY_TOLERANCE_SECS = 1.0
+
+
+class SharedSubscriber:
+    """A consumer of a shared subscription — the subscription type that honors
+    the delivery schedule — recording the wall-clock arrival time of every
+    message it receives."""
+
+    def __init__(self, pulsar_context, topic: str | None = None):
+        self._pulsar = pulsar_context._pulsar
+        self._consumer = pulsar_context._client.subscribe(
+            topic or pulsar_context.topic,
+            subscription_name=f"delayed-{uuid4()}",
+            consumer_type=self._pulsar.ConsumerType.Shared,
+            initial_position=self._pulsar.InitialPosition.Earliest,
+        )
+
+    def receive(self, timeout_secs: float):
+        """Returns ``(payload, publish_time, arrival_time)`` of the next
+        message, the times in seconds since the UNIX epoch, or ``None`` if
+        nothing arrives within the timeout."""
+        try:
+            message = self._consumer.receive(timeout_millis=int(timeout_secs * 1000))
+        except self._pulsar.Timeout:
+            return None
+        arrival = time.time()
+        self._consumer.acknowledge(message)
+        return (
+            message.data().decode(),
+            message.publish_timestamp() / 1000,
+            arrival,
+        )
+
+    def receive_all(self, expected_count: int, timeout_secs: float) -> list:
+        received: list[tuple[str, float, float]] = []
+        deadline = time.time() + timeout_secs
+        while len(received) < expected_count:
+            item = self.receive(max(deadline - time.time(), 0.001))
+            assert item is not None, (
+                f"only {len(received)} of {expected_count} messages arrived "
+                f"within {timeout_secs}s"
+            )
+            received.append(item)
+        return received
+
+    def assert_nothing_arrives_before(self, deadline: float) -> None:
+        """Verifies that no message is delivered before the ``deadline``
+        (seconds since the UNIX epoch), as long as the deadline is still far
+        enough ahead for the check to be meaningful."""
+        window = deadline - DELIVERY_TOLERANCE_SECS - time.time()
+        if window > 0:
+            assert self.receive(window) is None, "a scheduled message arrived early"
+
+    def close(self) -> None:
+        self._consumer.close()
+
+
+def _write_jsonl(path: pathlib.Path, rows: list[dict]) -> None:
+    with open(path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+@pytest.mark.parametrize("column_kind", ["int", "datetime_utc"])
+@pytest.mark.flaky(reruns=3)
+def test_pulsar_write_deliver_at_from_column(pulsar_context, tmp_path, column_kind):
+    """The deliver_at column of pw.io.pulsar.write schedules each message
+    for its own delivery time: the broker accepts the message right away but
+    hands it to a shared subscription only once that time comes. A delivery
+    time in the past means an immediate delivery. Both supported column types
+    work: integer milliseconds and UTC datetimes."""
+    input_file = tmp_path / "input.jsonl"
+    now_ms = int(time.time() * 1000)
+    delayed_at_ms = now_ms + DELIVER_AT_HORIZON_SECS * 1000
+    rows = [
+        {"name": "immediate", "at_ms": now_ms - 60_000},
+        {"name": "delayed", "at_ms": delayed_at_ms},
+    ]
+    _write_jsonl(input_file, rows)
+
+    class InputSchema(pw.Schema):
+        name: str
+        at_ms: int
+
+    G.clear()
+    table = pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+    if column_kind == "datetime_utc":
+        table = table.with_columns(at=table.at_ms.dt.utc_from_timestamp(unit="ms"))
+        deliver_at = table.at
+    else:
+        deliver_at = table.at_ms
+    pw.io.pulsar.write(
+        table,
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="plaintext",
+        value=table.name,
+        deliver_at=deliver_at,
+    )
+    pw.run()
+
+    delayed_at = delayed_at_ms / 1000
+    subscriber = SharedSubscriber(pulsar_context)
+    try:
+        first = subscriber.receive(WAIT_TIMEOUT_SECS)
+        assert first is not None
+        payload, publish_time, arrival = first
+        assert payload == "immediate"
+        assert arrival < delayed_at - DELIVERY_TOLERANCE_SECS
+
+        subscriber.assert_nothing_arrives_before(delayed_at)
+        second = subscriber.receive(WAIT_TIMEOUT_SECS)
+        assert second is not None
+        payload, publish_time, arrival = second
+        assert payload == "delayed"
+        # Published well before its delivery time, delivered no earlier than
+        # the broker's precision allows.
+        assert publish_time < delayed_at - DELIVERY_TOLERANCE_SECS
+        assert arrival >= delayed_at - DELIVERY_TOLERANCE_SECS
+        assert subscriber.receive(1.0) is None
+    finally:
+        subscriber.close()
+
+
+@pytest.mark.parametrize("delay_kind", ["int", "duration", "constant"])
+@pytest.mark.flaky(reruns=3)
+def test_pulsar_write_deliver_after(pulsar_context, tmp_path, delay_kind):
+    """deliver_after delays every message by the given amount counted from
+    the moment it is published — a per-row delay from an integer or a
+    duration column, or a constant timedelta for the whole table. A shared
+    subscription receives the message once the delay elapses, not before."""
+    input_file = tmp_path / "input.jsonl"
+    delay_ms = DELIVERY_DELAY_SECS * 1000
+    if delay_kind == "constant":
+        rows = [{"name": "delayed", "delay_ms": delay_ms}]
+    else:
+        rows = [
+            {"name": "immediate", "delay_ms": 0},
+            {"name": "delayed", "delay_ms": delay_ms},
+        ]
+    _write_jsonl(input_file, rows)
+
+    class InputSchema(pw.Schema):
+        name: str
+        delay_ms: int
+
+    G.clear()
+    table = pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+    deliver_after: pw.ColumnReference | datetime.timedelta
+    if delay_kind == "int":
+        deliver_after = table.delay_ms
+    elif delay_kind == "duration":
+        table = table.with_columns(
+            delay=pw.this.delay_ms * datetime.timedelta(milliseconds=1)
+        )
+        deliver_after = table.delay
+    else:
+        deliver_after = datetime.timedelta(milliseconds=delay_ms)
+    pw.io.pulsar.write(
+        table,
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="plaintext",
+        value=table.name,
+        deliver_after=deliver_after,
+    )
+    pw.run()
+
+    subscriber = SharedSubscriber(pulsar_context)
+    try:
+        if delay_kind != "constant":
+            first = subscriber.receive(WAIT_TIMEOUT_SECS)
+            assert first is not None
+            payload, publish_time, arrival = first
+            assert payload == "immediate"
+            assert (
+                arrival - publish_time < DELIVERY_DELAY_SECS - DELIVERY_TOLERANCE_SECS
+            )
+            # The delayed message was published in the same run, so its
+            # delivery is due no earlier than the delay after this one.
+            subscriber.assert_nothing_arrives_before(publish_time + DELIVERY_DELAY_SECS)
+        delayed = subscriber.receive(WAIT_TIMEOUT_SECS)
+        assert delayed is not None
+        payload, publish_time, arrival = delayed
+        assert payload == "delayed"
+        assert arrival - publish_time >= DELIVERY_DELAY_SECS - DELIVERY_TOLERANCE_SECS
+        assert subscriber.receive(1.0) is None
+    finally:
+        subscriber.close()
+
+
+@pytest.mark.flaky(reruns=3)
+def test_pulsar_write_delivers_every_scheduled_message_of_a_large_batch(
+    pulsar_context, tmp_path
+):
+    """Scheduling does not lose messages under volume: every row of a batch
+    far larger than the producer's batching and in-flight limits is
+    delivered, each one no earlier than its delay allows."""
+    input_file = tmp_path / "input.jsonl"
+    n_rows = 3000
+    _write_jsonl(input_file, [{"name": f"row-{i}"} for i in range(n_rows)])
+
+    class InputSchema(pw.Schema):
+        name: str
+
+    G.clear()
+    table = pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+    pw.io.pulsar.write(
+        table,
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="plaintext",
+        deliver_after=datetime.timedelta(seconds=DELIVERY_DELAY_SECS),
+    )
+    pw.run()
+
+    subscriber = SharedSubscriber(pulsar_context)
+    try:
+        received = subscriber.receive_all(n_rows, WAIT_TIMEOUT_SECS * 2)
+        assert {payload for payload, _, _ in received} == {
+            f"row-{i}" for i in range(n_rows)
+        }
+        assert all(
+            arrival - publish_time >= DELIVERY_DELAY_SECS - DELIVERY_TOLERANCE_SECS
+            for _, publish_time, arrival in received
+        )
+    finally:
+        subscriber.close()
+
+
+@pytest.mark.flaky(reruns=3)
+def test_pulsar_write_schedule_is_honored_by_shared_subscription_reader(
+    pulsar_context, tmp_path
+):
+    """pw.io.pulsar.read observes the delivery schedule of the messages
+    produced by pw.io.pulsar.write when it reads through a shared
+    subscription: the row appears in the pipeline only after the delay."""
+    input_file = tmp_path / "input.txt"
+    output_file = tmp_path / "output.jsonl"
+    input_file.write_text("scheduled\n")
+
+    G.clear()
+    table = pw.io.plaintext.read(input_file, mode="static")
+    pw.io.pulsar.write(
+        table,
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="plaintext",
+        deliver_after=datetime.timedelta(seconds=DELIVERY_DELAY_SECS),
+    )
+    pw.run()
+
+    G.clear()
+    table_reread = pw.io.pulsar.read(
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="plaintext",
+        subscription_type="shared",
+        with_metadata=True,
+        autocommit_duration_ms=100,
+    )
+    pw.io.jsonlines.write(table_reread, output_file)
+    wait_result_with_checker(
+        FileLinesNumberChecker(output_file, 1), WAIT_TIMEOUT_SECS * 2
+    )
+    arrival = time.time()
+
+    lines = [json.loads(line) for line in output_file.read_text().splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["data"] == "scheduled"
+    publish_time = lines[0]["_metadata"]["publish_time_millis"] / 1000
+    assert arrival - publish_time >= DELIVERY_DELAY_SECS - DELIVERY_TOLERANCE_SECS
+
+
+def test_pulsar_write_scheduled_messages_are_visible_to_partition_readers(
+    pulsar_context, tmp_path
+):
+    """The delivery schedule is a property of the shared subscriptions: the
+    partition readers — the mechanism of the static mode — see a scheduled
+    message as soon as it is stored, with its payload intact, and in the
+    record formats the schedule column stays a part of the payload."""
+    input_file = tmp_path / "input.jsonl"
+    output_file = tmp_path / "output.jsonl"
+    far_future_ms = int(time.time() * 1000) + 3_600_000
+    _write_jsonl(input_file, [{"name": "later", "at_ms": far_future_ms}])
+
+    class InputSchema(pw.Schema):
+        name: str
+        at_ms: int
+
+    G.clear()
+    table = pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+    pw.io.pulsar.write(
+        table, PULSAR_SERVICE_URI, pulsar_context.topic, deliver_at=table.at_ms
+    )
+    pw.run()
+
+    G.clear()
+    table_reread = pw.io.pulsar.read(
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="json",
+        schema=InputSchema,
+        mode="static",
+    )
+    pw.io.jsonlines.write(table_reread, output_file)
+    pw.run()
+
+    lines = [json.loads(line) for line in output_file.read_text().splitlines()]
+    assert [(line["name"], line["at_ms"]) for line in lines] == [
+        ("later", far_future_ms)
+    ]
+
+
+def test_pulsar_avro_payload_excludes_schedule_columns(pulsar_context, tmp_path):
+    """In the "avro" format the deliver_at / deliver_after columns are
+    service inputs like the keys and the event time: they stay out of the
+    registered schema and of the payloads."""
+    input_file = tmp_path / "input.jsonl"
+    _write_jsonl(input_file, [{"v": 1, "delay_ms": 0}, {"v": 2, "delay_ms": 0}])
+
+    class InputSchema(pw.Schema):
+        v: int
+        delay_ms: int
+
+    G.clear()
+    table = pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+    pw.io.pulsar.write(
+        table,
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="avro",
+        deliver_after=table.delay_ms,
+    )
+    pw.run()
+
+    response = requests.get(
+        f"{PULSAR_ADMIN_URL}/admin/v2/schemas/public/default/"
+        f"{pulsar_context.topic}/schema",
+        timeout=60,
+    )
+    response.raise_for_status()
+    registered = json.loads(response.json()["data"])
+    assert [field["name"] for field in registered["fields"]] == ["v"]
+
+    output_file = tmp_path / "output.jsonl"
+    G.clear()
+    table_reread = pw.io.pulsar.read(
+        PULSAR_SERVICE_URI, pulsar_context.topic, format="avro", mode="static"
+    )
+    assert set(table_reread.schema.column_names()) == {"v"}
+    pw.io.jsonlines.write(table_reread, output_file)
+    pw.run()
+    lines = [json.loads(line) for line in output_file.read_text().splitlines()]
+    assert {line["v"] for line in lines} == {1, 2}
+
+
+def _scheduling_table(tmp_path):
+    input_file = tmp_path / "input.jsonl"
+    _write_jsonl(input_file, [{"name": "x", "ts_ms": 1, "label": "a"}])
+
+    class InputSchema(pw.Schema):
+        name: str
+        ts_ms: int
+        label: str
+
+    G.clear()
+    return pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+
+
+def test_pulsar_write_rejects_deliver_at_together_with_deliver_after(
+    pulsar_context, tmp_path
+):
+    """A message has a single delivery time, so specifying both the absolute
+    deliver_at and the relative deliver_after is a configuration error
+    reported at construction."""
+    table = _scheduling_table(tmp_path)
+    with pytest.raises(ValueError, match="cannot be set at the same time"):
+        pw.io.pulsar.write(
+            table,
+            PULSAR_SERVICE_URI,
+            pulsar_context.topic,
+            deliver_at=table.ts_ms,
+            deliver_after=datetime.timedelta(seconds=1),
+        )
+    with pytest.raises(ValueError, match="cannot be set at the same time"):
+        pw.io.pulsar.write(
+            table,
+            PULSAR_SERVICE_URI,
+            pulsar_context.topic,
+            deliver_at=table.ts_ms,
+            deliver_after=table.ts_ms,
+        )
+
+
+def test_pulsar_write_rejects_naive_deliver_at(pulsar_context, tmp_path):
+    """A timezone-naive datetime column is rejected as the delivery time with
+    an error suggesting an explicit UTC conversion, instead of silently
+    assuming a timezone."""
+    table = _scheduling_table(tmp_path)
+    table = table.with_columns(naive_ts=table.ts_ms.dt.from_timestamp(unit="ms"))
+    with pytest.raises(ValueError, match="naive"):
+        pw.io.pulsar.write(
+            table, PULSAR_SERVICE_URI, pulsar_context.topic, deliver_at=table.naive_ts
+        )
+
+
+def test_pulsar_write_rejects_mistyped_schedule_columns(pulsar_context, tmp_path):
+    """A column of a type that cannot carry a delivery time or a delay (a
+    string here) is rejected at construction, naming the accepted types."""
+    table = _scheduling_table(tmp_path)
+    with pytest.raises(ValueError, match="delivery time column must be"):
+        pw.io.pulsar.write(
+            table, PULSAR_SERVICE_URI, pulsar_context.topic, deliver_at=table.label
+        )
+    with pytest.raises(ValueError, match="delivery delay column must be"):
+        pw.io.pulsar.write(
+            table, PULSAR_SERVICE_URI, pulsar_context.topic, deliver_after=table.label
+        )
+
+
+def test_pulsar_write_rejects_negative_constant_delay(pulsar_context, tmp_path):
+    """A negative constant deliver_after is a configuration error reported at
+    construction rather than a silently immediate delivery."""
+    table = _scheduling_table(tmp_path)
+    with pytest.raises(ValueError, match="must not be negative"):
+        pw.io.pulsar.write(
+            table,
+            PULSAR_SERVICE_URI,
+            pulsar_context.topic,
+            deliver_after=datetime.timedelta(seconds=-1),
+        )
+
+
+@pytest.mark.parametrize("parameter", ["deliver_at", "deliver_after"])
+def test_pulsar_write_rejects_negative_schedule_values(
+    pulsar_context, tmp_path, parameter
+):
+    """A negative delivery time or delay in the data fails the write with a
+    clear error instead of silently producing an immediately delivered
+    message."""
+    input_file = tmp_path / "input.jsonl"
+    _write_jsonl(input_file, [{"name": "x", "value": -5}])
+
+    class InputSchema(pw.Schema):
+        name: str
+        value: int
+
+    G.clear()
+    table = pw.io.jsonlines.read(input_file, schema=InputSchema, mode="static")
+    pw.io.pulsar.write(
+        table,
+        PULSAR_SERVICE_URI,
+        pulsar_context.topic,
+        format="plaintext",
+        value=table.name,
+        **{parameter: table.value},
+    )
+    expected = "delivery time" if parameter == "deliver_at" else "delivery delay"
+    with pytest.raises(Exception, match=expected):
+        pw.run()
+
+
+def test_pulsar_write_rejects_schedule_on_a_non_persistent_topic(
+    pulsar_context, tmp_path
+):
+    """A non-persistent topic dispatches every message immediately, ignoring
+    the schedule, so scheduling messages into one is an error: at
+    construction for a static topic name, and when the row is written for a
+    topic column."""
+    topic = f"non-persistent://public/default/{pulsar_context.topic}"
+    table = _scheduling_table(tmp_path)
+    with pytest.raises(ValueError, match="non-persistent"):
+        pw.io.pulsar.write(table, PULSAR_SERVICE_URI, topic, deliver_after=table.ts_ms)
+
+    table = table.with_columns(topic=topic)
+    pw.io.pulsar.write(
+        table, PULSAR_SERVICE_URI, topic=table.topic, deliver_after=table.ts_ms
+    )
+    with pytest.raises(Exception, match="non-persistent"):
+        pw.run()
+
+
 # --- Ordering-key tests ---
 
 

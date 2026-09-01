@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import Iterable, Literal
 
 from pathway.internals import api, datasink, datasource
@@ -107,6 +108,7 @@ def _construct_pulsar_settings(
     read_compacted: bool = False,
     producer_name: str | None = None,
     event_time_from_engine: bool = False,
+    deliver_after_millis: int | None = None,
 ) -> api.PulsarSettings | None:
     if (
         auth is None
@@ -115,6 +117,7 @@ def _construct_pulsar_settings(
         and not read_compacted
         and producer_name is None
         and not event_time_from_engine
+        and deliver_after_millis is None
     ):
         return None
     auth_kwargs = auth._settings_kwargs() if auth is not None else {}
@@ -125,6 +128,7 @@ def _construct_pulsar_settings(
         read_compacted=read_compacted,
         producer_name=producer_name,
         event_time_from_engine=event_time_from_engine,
+        deliver_after_millis=deliver_after_millis,
     )
 
 
@@ -538,6 +542,8 @@ def write(
     key: ColumnReference | None = None,
     ordering_key: ColumnReference | None = None,
     event_time: ColumnReference | EngineTimeMarker | None = None,
+    deliver_at: ColumnReference | None = None,
+    deliver_after: ColumnReference | datetime.timedelta | None = None,
     value: ColumnReference | None = None,
     headers: Iterable[ColumnReference] | None = None,
     compression: Literal["lz4", "zlib", "zstd"] | None = None,
@@ -573,8 +579,8 @@ def write(
             schema is declared to the broker's schema registry — see the
             *Schema registry* section above for the mechanics and the type
             conversions. The columns designated as the service inputs —
-            ``topic``, ``key``, ``ordering_key``, ``event_time``, ``headers`` —
-            stay out of the record; duplicate a column under another name with
+            ``topic``, ``key``, ``ordering_key``, ``event_time``, ``deliver_at``,
+            ``deliver_after``, ``headers`` — stay out of the record; duplicate a column under another name with
             ``table.select(...)`` if it must also be a part of the payload.
         delimiter: The delimiter separating the fields, if the ``"dsv"`` format is
             used.
@@ -603,6 +609,20 @@ def write(
             logical counter rather than a wall-clock timestamp; data read
             through ``pw.io.*`` connectors always carries wall-clock engine
             times, in both the streaming and the static modes.
+        deliver_at: The column carrying the delivery time of the messages,
+            for the *delayed delivery* — an integer (milliseconds since the
+            UNIX epoch) or a UTC datetime. The broker accepts and stores such
+            a message right away, but hands it to the consumers only once the
+            delivery time comes; a delivery time in the past delivers the
+            message immediately. Mutually exclusive with ``deliver_after``.
+            See the *Delayed delivery* section below for what the consumers
+            must look like to honor the schedule, and for the configurations
+            that are rejected.
+        deliver_after: The delay of the delivery, counted from the moment
+            the message is published: either a constant ``datetime.timedelta``
+            applied to every message, or a column reference holding the delay
+            of each row — a duration or an integer number of milliseconds.
+            Mutually exclusive with ``deliver_at``; the same caveats apply.
         value: The column carrying the payload of the messages in the
             ``"plaintext"`` or ``"raw"`` formats. Can be omitted if the table has
             exactly one column, which then becomes the payload.
@@ -640,6 +660,33 @@ def write(
 
     Returns:
         None
+
+    Delayed delivery:
+
+    ``deliver_at`` and ``deliver_after`` schedule the messages for a later
+    delivery. The schedule is honored only by the consumers of the
+    ``"shared"`` and ``"key_shared"`` subscriptions — the ``"exclusive"`` and
+    ``"failover"`` subscriptions and the partition readers receive the
+    messages as soon as they are published, as the Pulsar protocol defines.
+    ``pw.io.pulsar.read`` therefore observes the schedule only with
+    ``subscription_type="shared"`` or ``"key_shared"`` in the streaming
+    mode; its default partition-reader mechanism, the persistence-enabled
+    pipelines and the static mode read the scheduled messages immediately.
+    The broker must run with the delayed delivery enabled
+    (``delayedDeliveryEnabled``, the default), otherwise it ignores the
+    schedule; it releases the messages with the precision of its
+    delayed-delivery tick (``delayedDeliveryTickTimeMillis``, a second by
+    default). Every update of the table follows the schedule of its row,
+    the deletions included.
+
+    The configurations that cannot work are rejected instead of publishing
+    messages that would be delivered immediately: ``deliver_at`` and
+    ``deliver_after`` together, a timezone-naive datetime column, a column of
+    another type, a negative delay or delivery time (at the construction or
+    when the row is written), and a ``non-persistent://`` topic, which stores
+    no messages and dispatches everything at once. The scheduled messages are
+    published one by one rather than in the producer batches, so the write
+    throughput with a schedule is lower than without one.
 
     Example:
 
@@ -712,6 +759,36 @@ def write(
     ...     compression="zstd",
     ... )
 
+    A message can be scheduled for a later delivery. With a constant delay
+    every message is handed to the ``"shared"`` and ``"key_shared"``
+    consumers a minute after it is published:
+
+    >>> import datetime
+    >>> pw.io.pulsar.write(
+    ...     t,
+    ...     "pulsar://localhost:6650",
+    ...     "clients",
+    ...     deliver_after=datetime.timedelta(minutes=1),
+    ... )
+
+    The schedule can also come from the data — for example, a reminder is
+    delivered at the time stored in its row, given either as an integer
+    number of milliseconds since the UNIX epoch or as a UTC datetime:
+
+    >>> reminders = pw.debug.table_from_markdown(
+    ...     '''
+    ...     text        | remind_at_ms
+    ...     water-plants | 1893456000000
+    ...     call-alice   | 1893542400000
+    ...     '''
+    ... )
+    >>> pw.io.pulsar.write(
+    ...     reminders,
+    ...     "pulsar://localhost:6650",
+    ...     "reminders",
+    ...     deliver_at=reminders.remind_at_ms,
+    ... )
+
     Finally, for a token-protected cluster pass the authentication object —
     the same way as in ``read``:
 
@@ -732,6 +809,35 @@ def write(
             "broker assign a generated name."
         )
 
+    if deliver_at is not None and deliver_after is not None:
+        raise ValueError(
+            "'deliver_at' and 'deliver_after' cannot be set at the same time: "
+            "a message has a single delivery time, given either as an absolute "
+            "timestamp or as a delay from the publishing."
+        )
+    deliver_after_column: ColumnReference | None = None
+    deliver_after_millis: int | None = None
+    if isinstance(deliver_after, datetime.timedelta):
+        if deliver_after < datetime.timedelta(0):
+            raise ValueError(
+                f"'deliver_after' must not be negative, got {deliver_after!r}. "
+                "Drop the parameter to deliver the messages immediately."
+            )
+        deliver_after_millis = deliver_after // datetime.timedelta(milliseconds=1)
+    else:
+        deliver_after_column = deliver_after
+    if (
+        isinstance(topic, str)
+        and topic.startswith("non-persistent://")
+        and (deliver_at is not None or deliver_after is not None)
+    ):
+        raise ValueError(
+            f"the non-persistent Pulsar topic '{topic}' ignores the delivery "
+            "schedule (deliver_at / deliver_after): such topics store no "
+            "messages and the broker dispatches everything immediately. "
+            "Publish the delayed messages into a persistent topic."
+        )
+
     event_time_column: ColumnReference | None
     if isinstance(event_time, EngineTimeMarker):
         event_time_from_engine = True
@@ -746,6 +852,8 @@ def write(
         key=key,
         ordering_key=ordering_key,
         event_time=event_time_column,
+        deliver_at=deliver_at,
+        deliver_after=deliver_after_column,
         value=value,
         headers=headers,
         topic_name=topic if isinstance(topic, ColumnReference) else None,
@@ -763,6 +871,8 @@ def write(
         key_field_index=output_format.key_field_index,
         ordering_key_field_index=output_format.ordering_key_field_index,
         event_time_field_index=output_format.event_time_field_index,
+        deliver_at_field_index=output_format.deliver_at_field_index,
+        deliver_after_field_index=output_format.deliver_after_field_index,
         header_fields=list(output_format.header_fields.items()),
         tls_settings=tls_settings.settings if tls_settings is not None else None,
         pulsar_settings=_construct_pulsar_settings(
@@ -770,6 +880,7 @@ def write(
             compression=compression,
             producer_name=producer_name,
             event_time_from_engine=event_time_from_engine,
+            deliver_after_millis=deliver_after_millis,
         ),
     )
 

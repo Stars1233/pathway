@@ -106,7 +106,9 @@ pub use self::polling::{LiveState, PolledRow, PollingDataSource, PollingReader};
 pub use self::postgres::{
     PostgresError, PsqlReader, PsqlWriter, ReplicationError as PostgresReplicationError, SslError,
 };
-pub use self::pulsar::{PulsarError, PulsarReader, PulsarWriter};
+pub use self::pulsar::{
+    DeliverySchedule as PulsarDeliverySchedule, PulsarError, PulsarReader, PulsarWriter,
+};
 pub use self::rabbitmq::{RabbitmqError, RabbitmqReader, RabbitmqWriter};
 pub use self::sqlite::{SqliteError, SqliteReader, SqliteWriter};
 pub use self::weaviate::{WeaviateError, WeaviateWriter};

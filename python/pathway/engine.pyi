@@ -915,6 +915,7 @@ class PulsarSettings:
         read_compacted: bool = False,
         producer_name: str | None = None,
         event_time_from_engine: bool = False,
+        deliver_after_millis: int | None = None,
     ) -> None: ...
 
 class TableWriterInitMode(Enum):
@@ -960,6 +961,8 @@ class DataStorage:
         key_field_index: int | None = None,
         ordering_key_field_index: int | None = None,
         event_time_field_index: int | None = None,
+        deliver_at_field_index: int | None = None,
+        deliver_after_field_index: int | None = None,
         min_commit_frequency: int | None = None,
         downloader_threads_count: int | None = None,
         database: str | None = None,

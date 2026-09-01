@@ -470,6 +470,8 @@ class MessageQueueOutputFormat:
     key_field_index: int | None
     ordering_key_field_index: int | None
     event_time_field_index: int | None
+    deliver_at_field_index: int | None
+    deliver_after_field_index: int | None
     header_fields: dict[str, int]
     data_format: api.DataFormat
     topic_name_index: int | None
@@ -484,6 +486,8 @@ class MessageQueueOutputFormat:
         key: ColumnReference | None = None,
         ordering_key: ColumnReference | None = None,
         event_time: ColumnReference | None = None,
+        deliver_at: ColumnReference | None = None,
+        deliver_after: ColumnReference | None = None,
         value: ColumnReference | None = None,
         headers: Iterable[ColumnReference] | None = None,
         topic_name: ColumnReference | None = None,
@@ -569,22 +573,33 @@ class MessageQueueOutputFormat:
             )
         event_time_field_index = None
         if event_time is not None:
-            event_time_dtype = table[event_time._name]._column.dtype
-            if event_time_dtype == dt.DATE_TIME_NAIVE:
-                raise ValueError(
-                    "The event time column must not be a timezone-naive "
-                    "datetime: its UTC interpretation would be a silent "
-                    "assumption. Convert it explicitly, e.g. with "
-                    "`.dt.to_utc(...)`."
-                )
-            if event_time_dtype not in (dt.INT, dt.DATE_TIME_UTC, dt.ANY):
-                raise ValueError(
-                    "The event time column must be an integer (milliseconds "
-                    "since the UNIX epoch) or a UTC datetime, however "
-                    f"{event_time_dtype.typehint} is used"
-                )
+            cls.check_timestamp_column(table, event_time, "event time")
             event_time_field_index = cls.add_column_reference_to_extract(
                 event_time, columns_to_extract, extracted_field_indices
+            )
+        if deliver_at is not None and deliver_after is not None:
+            raise ValueError(
+                "'deliver_at' and 'deliver_after' cannot be set at the same "
+                "time: a message has a single delivery time, given either as "
+                "an absolute timestamp or as a delay from the publishing."
+            )
+        deliver_at_field_index = None
+        if deliver_at is not None:
+            cls.check_timestamp_column(table, deliver_at, "delivery time")
+            deliver_at_field_index = cls.add_column_reference_to_extract(
+                deliver_at, columns_to_extract, extracted_field_indices
+            )
+        deliver_after_field_index = None
+        if deliver_after is not None:
+            deliver_after_dtype = table[deliver_after._name]._column.dtype
+            if deliver_after_dtype not in (dt.INT, dt.DURATION, dt.ANY):
+                raise ValueError(
+                    "The delivery delay column must be an integer (milliseconds) "
+                    "or a duration, however "
+                    f"{deliver_after_dtype.typehint} is used"
+                )
+            deliver_after_field_index = cls.add_column_reference_to_extract(
+                deliver_after, columns_to_extract, extracted_field_indices
             )
         if headers is not None:
             reserved_header_names = {"pathway_time", "pathway_diff"}
@@ -635,7 +650,8 @@ class MessageQueueOutputFormat:
             if format == "avro":
                 # The registered Avro schema is a public, versioned contract
                 # of the topic, so the service columns — the dynamic topic,
-                # the keys, the event time and the headers — stay out of the
+                # the keys, the event time, the delivery schedule and the
+                # headers — stay out of the
                 # payload. A column needed both as a service input and in the
                 # payload can be duplicated under another name with
                 # `table.select(...)`.
@@ -644,6 +660,8 @@ class MessageQueueOutputFormat:
                     key_field_index,
                     ordering_key_field_index,
                     event_time_field_index,
+                    deliver_at_field_index,
+                    deliver_after_field_index,
                     *header_fields.values(),
                 }
                 payload_field_indices = [
@@ -655,7 +673,8 @@ class MessageQueueOutputFormat:
                     raise ValueError(
                         "format='avro' needs at least one payload column, but "
                         "every column of the table is used as a service column "
-                        "(topic/key/ordering_key/event_time/headers). Duplicate "
+                        "(topic/key/ordering_key/event_time/deliver_at/"
+                        "deliver_after/headers). Duplicate "
                         "a column under another name with `table.select(...)` if "
                         "it must serve both purposes."
                     )
@@ -723,10 +742,33 @@ class MessageQueueOutputFormat:
             key_field_index=key_field_index,
             ordering_key_field_index=ordering_key_field_index,
             event_time_field_index=event_time_field_index,
+            deliver_at_field_index=deliver_at_field_index,
+            deliver_after_field_index=deliver_after_field_index,
             header_fields=header_fields,
             data_format=data_format,
             topic_name_index=topic_name_index,
         )
+
+    @staticmethod
+    def check_timestamp_column(
+        table: Table, column: ColumnReference, purpose: str
+    ) -> None:
+        """Checks that the column can carry a message timestamp: an integer
+        (milliseconds since the UNIX epoch) or a UTC datetime."""
+        dtype = table[column._name]._column.dtype
+        if dtype == dt.DATE_TIME_NAIVE:
+            raise ValueError(
+                f"The {purpose} column must not be a timezone-naive "
+                "datetime: its UTC interpretation would be a silent "
+                "assumption. Convert it explicitly, e.g. with "
+                "`.dt.to_utc(...)`."
+            )
+        if dtype not in (dt.INT, dt.DATE_TIME_UTC, dt.ANY):
+            raise ValueError(
+                f"The {purpose} column must be an integer (milliseconds "
+                "since the UNIX epoch) or a UTC datetime, however "
+                f"{dtype.typehint} is used"
+            )
 
     @staticmethod
     def add_column_reference_to_extract(

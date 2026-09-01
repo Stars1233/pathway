@@ -153,6 +153,10 @@ const PARTITION_COUNT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 // again and spin a hot error loop.
 const PUMP_RESPAWN_DELAY: Duration = Duration::from_secs(5);
 
+// The scheme of the topics that store no messages. Such topics ignore the
+// delivery schedule: the broker dispatches everything immediately.
+const NON_PERSISTENT_TOPIC_PREFIX: &str = "non-persistent://";
+
 #[derive(Debug, thiserror::Error)]
 pub enum PulsarError {
     #[error(transparent)]
@@ -173,6 +177,27 @@ pub enum PulsarError {
          epoch are supported"
     )]
     IncorrectEventTimeValue(Value),
+
+    #[error(
+        "value {0} cannot be used as a delivery time: only non-negative integers \
+         (milliseconds since the UNIX epoch) and UTC datetimes at or after the \
+         epoch are supported"
+    )]
+    IncorrectDeliverAtValue(Value),
+
+    #[error(
+        "value {0} cannot be used as a delivery delay: only non-negative \
+         integers (milliseconds) and non-negative durations are supported"
+    )]
+    IncorrectDeliverAfterValue(Value),
+
+    #[error(
+        "the Pulsar topic '{topic}' is non-persistent, and such topics ignore \
+         the delivery schedule (deliver_at / deliver_after): the broker would \
+         dispatch the messages immediately. Publish the delayed messages into \
+         a persistent topic"
+    )]
+    DelayedDeliveryOnNonPersistentTopic { topic: String },
 
     #[error(
         "value {0} can't be used as an ordering key because it's neither \
@@ -1574,6 +1599,7 @@ struct PendingMessage {
     partition_key: Option<String>,
     ordering_key: Option<Vec<u8>>,
     event_time: Option<u64>,
+    deliver_at_time: Option<i64>,
 }
 
 impl PendingMessage {
@@ -1584,6 +1610,7 @@ impl PendingMessage {
             partition_key: self.partition_key.clone(),
             ordering_key: self.ordering_key.clone(),
             event_time: self.event_time,
+            deliver_at_time: self.deliver_at_time,
             ..PulsarProducerMessage::default()
         }
     }
@@ -1612,6 +1639,22 @@ async fn retry_transient_pulsar_errors<T>(
             }
         }
     }
+}
+
+/// When the broker delivers the produced messages to the consumers of the
+/// shared and key-shared subscriptions (the other subscription types and the
+/// partition readers ignore the schedule, as the protocol defines).
+#[derive(Clone, Debug)]
+pub enum DeliverySchedule {
+    /// No schedule: the messages are delivered as soon as they are published.
+    Immediate,
+    /// The column carrying the absolute delivery time of each message.
+    AtColumn(usize),
+    /// The column carrying the delay of each message, counted from the
+    /// moment it is published.
+    AfterColumn(usize),
+    /// The same delay for every message, in milliseconds.
+    AfterMillis(u64),
 }
 
 #[allow(clippy::module_name_repetitions)]
@@ -1660,6 +1703,7 @@ pub struct PulsarWriter {
     // At most one of the two options is set; the caller validates that.
     event_time_field_index: Option<usize>,
     event_time_from_engine: bool,
+    delivery_schedule: DeliverySchedule,
     // The codec the producers compress the outgoing messages with. `None`
     // sends the payloads uncompressed. The reading side needs no matching
     // setting: the codec travels in the message metadata and the consumers
@@ -1691,6 +1735,7 @@ impl PulsarWriter {
         ordering_key_field_index: Option<usize>,
         event_time_field_index: Option<usize>,
         event_time_from_engine: bool,
+        delivery_schedule: DeliverySchedule,
         compression: Option<PulsarCompression>,
         producer_name: Option<String>,
         declared_avro_schema: Option<String>,
@@ -1710,6 +1755,7 @@ impl PulsarWriter {
             ordering_key_field_index,
             event_time_field_index,
             event_time_from_engine,
+            delivery_schedule,
             compression,
             producer_name,
             declared_avro_schema,
@@ -1725,6 +1771,7 @@ impl PulsarWriter {
             .as_mut()
             .expect("producers are set until drop");
         if !producers.contains_key(topic) {
+            let batching_allowed = matches!(self.delivery_schedule, DeliverySchedule::Immediate);
             let schema = self.declared_avro_schema.as_ref().map(|schema_json| {
                 pulsar::message::proto::Schema {
                     r#type: pulsar::message::proto::schema::Type::Avro as i32,
@@ -1737,8 +1784,13 @@ impl PulsarWriter {
                     .producer()
                     .with_topic(topic)
                     .with_options(ProducerOptions {
-                        batch_size: Some(PRODUCER_BATCH_SIZE),
-                        batch_byte_size: Some(PRODUCER_BATCH_MAX_BYTES),
+                        // A batch carries a single delivery time in its
+                        // envelope and the client library drops the
+                        // per-message ones, so the scheduled messages
+                        // must be published one by one (the Java client
+                        // bypasses batching for them the same way).
+                        batch_size: batching_allowed.then_some(PRODUCER_BATCH_SIZE),
+                        batch_byte_size: batching_allowed.then_some(PRODUCER_BATCH_MAX_BYTES),
                         // Await queue space instead of failing with
                         // `SlowDown` when the client's outbound channel
                         // is full.
@@ -1903,6 +1955,12 @@ impl PulsarWriter {
             // receipts of the affected messages fail or time out below, and
             // the messages are republished.
             for producer in producers.values_mut() {
+                // The scheduled messages are published one by one (see
+                // `ensure_producer`), and the client library reports the
+                // batch flush of such a producer as an error.
+                if producer.options().batch_size.is_none() {
+                    continue;
+                }
                 if let Err(error) = producer.send_batch().await {
                     if pulsar_error_is_permanent(&error) {
                         return Err(
@@ -2080,16 +2138,66 @@ impl PulsarWriter {
         }
         Ok(None)
     }
+
+    /// The `deliver_at_time` of the messages, in milliseconds since the UNIX
+    /// epoch, as the protocol carries it. The delays are counted from now:
+    /// the message is published right after this is computed.
+    fn row_deliver_at_time(&self, data: &FormatterContext) -> Result<Option<i64>, WriteError> {
+        let delay_millis = match self.delivery_schedule {
+            DeliverySchedule::Immediate => return Ok(None),
+            DeliverySchedule::AtColumn(index) => {
+                let millis = match &data.values[index] {
+                    Value::Int(millis) if *millis >= 0 => *millis,
+                    Value::DateTimeUtc(datetime) if datetime.timestamp_milliseconds() >= 0 => {
+                        datetime.timestamp_milliseconds()
+                    }
+                    other => {
+                        return Err(PulsarError::IncorrectDeliverAtValue(other.clone()).into());
+                    }
+                };
+                return Ok(Some(millis));
+            }
+            DeliverySchedule::AfterColumn(index) => match &data.values[index] {
+                Value::Int(millis) if *millis >= 0 => *millis,
+                Value::Duration(duration) if duration.milliseconds() >= 0 => {
+                    duration.milliseconds()
+                }
+                other => {
+                    return Err(PulsarError::IncorrectDeliverAfterValue(other.clone()).into());
+                }
+            },
+            DeliverySchedule::AfterMillis(millis) => {
+                i64::try_from(millis).expect("the delay is validated by the caller")
+            }
+        };
+        let now_millis = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the system clock is set after the UNIX epoch")
+                .as_millis(),
+        )
+        .expect("the current time fits into i64 milliseconds");
+        Ok(Some(now_millis.saturating_add(delay_millis)))
+    }
 }
 
 impl Writer for PulsarWriter {
     fn write(&mut self, data: FormatterContext) -> Result<(), WriteError> {
         let effective_topic = self.topic.get_for_posting(&data.values)?;
+        if !matches!(self.delivery_schedule, DeliverySchedule::Immediate)
+            && effective_topic.starts_with(NON_PERSISTENT_TOPIC_PREFIX)
+        {
+            return Err(PulsarError::DelayedDeliveryOnNonPersistentTopic {
+                topic: effective_topic,
+            }
+            .into());
+        }
         self.ensure_producer(&effective_topic)?;
 
         let partition_key = self.row_partition_key(&data)?;
         let ordering_key = self.row_ordering_key(&data)?;
         let event_time = self.row_event_time(&data)?;
+        let deliver_at_time = self.row_deliver_at_time(&data)?;
 
         // User-defined header values are serialized to JSON strings because
         // Pulsar message properties are string-to-string pairs. pathway_time
@@ -2148,6 +2256,7 @@ impl Writer for PulsarWriter {
                     partition_key: Some(partition_key.clone()),
                     ordering_key: ordering_key.clone(),
                     event_time,
+                    deliver_at_time,
                 };
                 let send_future = Self::send_pending_message(
                     producers,
