@@ -25,6 +25,7 @@ from pathway.io._utils import (
     check_raw_and_plaintext_only_kwargs_for_message_queues,
     construct_schema_and_data_format,
     internal_connector_mode,
+    remap_sort_by,
 )
 
 
@@ -731,7 +732,7 @@ def write(
         subject=subject,
     )
     output_table = output_format.table
-    remapped_sort_by = _remap_sort_by(sort_by, table, output_table)
+    remapped_sort_by = remap_sort_by(sort_by, table, output_table, "pw.io.kafka.write")
 
     data_storage = api.DataStorage(
         storage_type="kafka",
@@ -751,34 +752,6 @@ def write(
             sort_by=remapped_sort_by,
         )
     )
-
-
-def _remap_sort_by(
-    sort_by: Iterable[ColumnReference] | None,
-    original_table: Table,
-    output_table: Table,
-) -> list[ColumnReference] | None:
-    if sort_by is None:
-        return None
-    remapped: list[ColumnReference] = []
-    for column in sort_by:
-        if column._table is output_table:
-            remapped.append(column)
-            continue
-        if column._table is not original_table:
-            raise ValueError(
-                f"The sort_by column {column} doesn't belong to the table "
-                "passed to pw.io.kafka.write."
-            )
-        if column.name not in output_table._columns:
-            raise ValueError(
-                f"The sort_by column {column.name!r} is not part of the "
-                "data being written. For 'raw' or 'plaintext' format, only "
-                "the 'value', 'key', 'topic_name' and 'headers' columns "
-                "are forwarded."
-            )
-        remapped.append(output_table[column.name])
-    return remapped
 
 
 __all__ = [

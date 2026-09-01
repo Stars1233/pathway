@@ -21,6 +21,7 @@ from pathway.io._utils import (
     construct_schema_and_data_format,
     explore_schema,
     internal_connector_mode,
+    remap_sort_by,
     resolve_start_from_timestamp_ms,
 )
 
@@ -207,7 +208,9 @@ def read(
     Args:
         uri: The Pulsar service URI, e.g. ``pulsar://localhost:6650`` or
             ``pulsar+ssl://my-cluster:6651`` for a TLS-encrypted connection.
-        topic: The name of the topic to read from.
+        topic: The name of the topic to read from. A ``non-persistent://``
+            topic is accepted only in the streaming mode with a subscription
+            type (see the topic-persistence notes in the overview above).
         schema: Schema of the resulting table. For the ``"json"`` and ``"avro"``
             formats it may be omitted: the columns are then deduced from the
             topic's registry schema (see the *Schema registry* section above
@@ -239,12 +242,11 @@ def read(
             non-durable cursor only lives as long as the connection, so
             whenever the broker drops it (a topic unload, a rebalancing, a
             broker restart) the reading resumes from ``start_from`` and the
-            messages processed so far are delivered again. Provide an explicit
-            name, or use the partition-reader mode, for the pipelines that
-            must not see such repetitions. Multi-process runs of the
-            ``"shared"`` and ``"key_shared"`` types require an explicit name
-            as well, because every process must attach to one shared
-            subscription. The partition-reader mode does not create
+            messages processed so far are delivered again (the overview above
+            compares the recovery guarantees of the mechanisms). Multi-process
+            runs of the ``"shared"`` and ``"key_shared"`` types require an
+            explicit name as well, because every process must attach to one
+            shared subscription. The partition-reader mode does not create
             broker-side subscriptions and ignores this parameter.
         subscription_type: The reading mechanism. ``"reader"`` is the
             Kafka-like partition-reader mode — required for (and implied by)
@@ -293,7 +295,9 @@ def read(
             timestamp, in milliseconds since the UNIX epoch),
             ``event_time_millis`` (the producer-assigned event timestamp, or
             ``null`` if the producer didn't set one), ``producer_name``,
-            ``ordering_key`` (base64-encoded, or ``null``) and ``properties``
+            ``ordering_key`` (base64-encoded, or ``null``), ``schema_version``
+            (the registry version the message was produced under, or ``null``
+            for the messages produced without a schema) and ``properties``
             (the user-defined message properties, a string-to-string map).
         start_from: The position to start reading from, if the subscription does not
             exist yet: ``"beginning"`` reads the topic from the earliest available
@@ -447,6 +451,17 @@ def read(
             "subscription_name must not be empty: Pulsar cannot attach a "
             "subscription under an empty name, and the connector would deliver "
             "nothing. Drop the parameter to let the connector generate a name."
+        )
+    if topic.startswith("non-persistent://") and (
+        mode == "static" or subscription_type == "reader"
+    ):
+        raise ValueError(
+            "a non-persistent Pulsar topic cannot be read through the "
+            "partition-reader mechanism: it stores no messages, so there are "
+            "no positions to read from — the static mode has nothing to "
+            'snapshot and subscription_type="reader" nothing to replay. '
+            "Use a persistent topic, or the streaming mode with a "
+            "subscription type"
         )
     if read_compacted and (
         mode != "streaming" or subscription_type not in ("exclusive", "failover")
@@ -735,6 +750,9 @@ def write(
         headers=headers,
         topic_name=topic if isinstance(topic, ColumnReference) else None,
     )
+    # The sink is attached to the table `construct` rebuilt, so the
+    # sort_by references taken against the original one are remapped.
+    sort_by = remap_sort_by(sort_by, table, output_format.table, "pw.io.pulsar.write")
     table = output_format.table
 
     data_storage = api.DataStorage(

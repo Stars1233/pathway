@@ -29,11 +29,15 @@ import time
 from uuid import uuid4
 
 import pytest
+import requests
 
 pulsar = pytest.importorskip("pulsar")
 
 from .utils import (  # noqa: E402
+    PULSAR_ADMIN_URL,
     PULSAR_SERVICE_URI,
+    SIGKILL_COMPLETION_TIMEOUT_SEC,
+    SIGKILL_SUBSCRIPTION_TIMEOUT_SEC,
     IdentityPipelineRun,
     assert_messages_survive_sigkill_restart,
 )
@@ -48,12 +52,19 @@ class PulsarPublisher:
         self._client = pulsar.Client(
             uri, logger=pulsar.ConsoleLogger(pulsar.LoggerLevel.Warn)
         )
+        self._topic = topic
         self._producer = self._client.create_producer(topic)
 
     def publish(self, payload: str):
         # `send` resolves on the broker's acknowledgement, so a returned
         # publish is durably accepted by the topic.
         self._producer.send(payload.encode())
+
+    def reconnect(self):
+        # A producer resolves the partitions of its topic when it is created,
+        # so publishing into partitions added later needs a fresh one.
+        self._producer.close()
+        self._producer = self._client.create_producer(self._topic)
 
     def stop(self):
         self._producer.close()
@@ -75,6 +86,78 @@ def test_pulsar_messages_survive_sigkill_restart(tmp_path):
 
     try:
         assert_messages_survive_sigkill_restart(make_run, publisher.publish, "messages")
+    finally:
+        publisher.stop()
+
+
+def test_pulsar_restart_reads_the_partitions_added_while_it_was_down(tmp_path):
+    """A reader is attached to the partitions the topic had when it started
+    and reports an expansion instead of skipping the new partitions silently.
+    The remedy it recommends — restart the pipeline — must then work: the
+    restarted run reads the partitions added while it was down, and resumes
+    the old ones from their checkpointed positions."""
+    suffix = uuid4().hex
+    topic = f"expansion-{suffix}"
+    response = requests.put(
+        f"{PULSAR_ADMIN_URL}/admin/v2/persistent/public/default/{topic}/partitions",
+        json=2,
+        timeout=60,
+    )
+    response.raise_for_status()
+    publisher = PulsarPublisher(PULSAR_SERVICE_URI, topic)
+
+    def make_run(run_index):
+        return IdentityPipelineRun(
+            tmp_path,
+            IDENTITY_PROGRAM_PATH,
+            ["--uri", PULSAR_SERVICE_URI, "--topic", topic],
+            run_index,
+        )
+
+    before = {f"before-{i:03d}" for i in range(20)}
+    after = {f"after-{i:03d}" for i in range(40)}
+    try:
+        for payload in sorted(before):
+            publisher.publish(payload)
+        run0 = make_run(0)
+        try:
+            deadline = time.monotonic() + SIGKILL_SUBSCRIPTION_TIMEOUT_SEC
+            while time.monotonic() < deadline and run0.received_payloads() != before:
+                time.sleep(0.2)
+            assert (
+                run0.received_payloads() == before
+            ), f"the first run did not read the topic; log tail:\n{run0.log_tail()}"
+        finally:
+            run0.stop()
+
+        response = requests.post(
+            f"{PULSAR_ADMIN_URL}/admin/v2/persistent/public/default/{topic}/partitions",
+            json=4,
+            timeout=60,
+        )
+        response.raise_for_status()
+        publisher.reconnect()
+        for payload in sorted(after):
+            publisher.publish(payload)
+
+        run1 = make_run(1)
+        try:
+            deadline = time.monotonic() + SIGKILL_COMPLETION_TIMEOUT_SEC
+            while time.monotonic() < deadline:
+                if (
+                    before | after
+                    <= run0.received_payloads() | run1.received_payloads()
+                ):
+                    break
+                time.sleep(0.5)
+            received = run0.received_payloads() | run1.received_payloads()
+            missing = sorted((before | after) - received)
+            assert not missing, (
+                f"{len(missing)} messages were never read after the expansion, "
+                f"e.g. {missing[:10]}; log tail:\n{run1.log_tail()}"
+            )
+        finally:
+            run1.stop()
     finally:
         publisher.stop()
 

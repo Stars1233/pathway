@@ -851,6 +851,42 @@ def explore_schema(
     return schema
 
 
+def remap_sort_by(
+    sort_by: Iterable[ColumnReference] | None,
+    original_table: Table,
+    output_table: Table,
+    connector_name: str,
+) -> list[ColumnReference] | None:
+    """Rewrites the ``sort_by`` columns onto the table the sink is attached to.
+
+    The message-queue writers rebuild their input with ``table.select(...)`` to
+    lay the service columns out for the engine, so the references the caller
+    passed — taken against the table they called ``write`` on — belong to a
+    different table and the sink would reject them.
+    """
+    if sort_by is None:
+        return None
+    remapped: list[ColumnReference] = []
+    for column in sort_by:
+        if column._table is output_table:
+            remapped.append(column)
+            continue
+        if column._table is not original_table:
+            raise ValueError(
+                f"The sort_by column {column} doesn't belong to the table "
+                f"passed to {connector_name}."
+            )
+        if column.name not in output_table._columns:
+            raise ValueError(
+                f"The sort_by column {column.name!r} is not part of the "
+                "data being written. For 'raw' or 'plaintext' format, only "
+                "the columns forwarded to the message (the payload, the keys, "
+                "the topic name and the headers) are."
+            )
+        remapped.append(output_table[column.name])
+    return remapped
+
+
 def resolve_start_from_timestamp_ms(
     start_from: str,
     start_from_timestamp_ms: int | None,

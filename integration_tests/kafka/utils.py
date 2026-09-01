@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1027,6 +1028,108 @@ class PulsarTestContext:
         finally:
             consumer.close()
         return messages
+
+
+class BrokerTcpProxy:
+    """A TCP proxy in front of a broker, so that a test can cut every
+    connection to it the way a broker restart does.
+
+    The Pulsar client keeps talking to the address it was configured with
+    whenever the broker a lookup points at differs from it (the protocol's
+    proxy mode), so pointing a connector at this proxy routes all of its
+    traffic through it. While the proxy is cut, the established connections
+    are closed and the new ones are refused, which is what the client sees
+    when the broker goes away; ``restore`` lets it connect again.
+    """
+
+    def __init__(self, upstream_host: str, upstream_port: int):
+        self._upstream = (upstream_host, upstream_port)
+        self._sockets: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._cut = False
+        self._closed = False
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(128)
+        self.port = self._listener.getsockname()[1]
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    @property
+    def uri(self) -> str:
+        return f"pulsar://127.0.0.1:{self.port}"
+
+    def _accept_loop(self) -> None:
+        while True:
+            try:
+                downstream, _ = self._listener.accept()
+            except OSError:
+                return
+            if self._closed:
+                downstream.close()
+                return
+            if self._cut:
+                downstream.close()
+                continue
+            try:
+                upstream = socket.create_connection(self._upstream, timeout=10)
+            except OSError:
+                downstream.close()
+                continue
+            upstream.settimeout(None)
+            with self._lock:
+                # Re-checked under the lock: a connection accepted while
+                # ``cut`` was sweeping the registry would otherwise slip past
+                # both the flag check above and the sweep, keeping a live
+                # tunnel to the broker through the simulated outage.
+                cut_meanwhile = self._cut
+                if not cut_meanwhile:
+                    self._sockets += [downstream, upstream]
+            if cut_meanwhile:
+                downstream.close()
+                upstream.close()
+                continue
+            for source, sink in ((downstream, upstream), (upstream, downstream)):
+                threading.Thread(
+                    target=self._pipe, args=(source, sink), daemon=True
+                ).start()
+
+    @staticmethod
+    def _pipe(source: socket.socket, sink: socket.socket) -> None:
+        try:
+            while True:
+                chunk = source.recv(65536)
+                if not chunk:
+                    break
+                sink.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            for endpoint in (source, sink):
+                try:
+                    endpoint.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def cut(self) -> None:
+        """Closes every live connection and starts refusing the new ones."""
+        self._cut = True
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for endpoint in sockets:
+            try:
+                endpoint.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            endpoint.close()
+
+    def restore(self) -> None:
+        self._cut = False
+
+    def close(self) -> None:
+        self._closed = True
+        self.cut()
+        self._listener.close()
 
 
 PULSAR_ADMIN_URL = os.environ.get("PULSAR_ADMIN_URL", "http://pulsar:8080")

@@ -58,8 +58,9 @@ use pulsar::compression::{
 };
 use pulsar::consumer::InitialPosition as PulsarInitialPosition;
 use pulsar::{
-    Authentication as PulsarAuthentication, ConsumerOptions as PulsarConsumerOptions, Pulsar,
-    SubType as PulsarSubType, TokioExecutor,
+    Authentication as PulsarAuthentication, ConsumerOptions as PulsarConsumerOptions,
+    OperationRetryOptions as PulsarOperationRetryOptions, Pulsar, SubType as PulsarSubType,
+    TokioExecutor,
 };
 use pyo3::exceptions::{
     PyBaseException, PyException, PyIOError, PyIndexError, PyKeyError, PyNotImplementedError,
@@ -132,7 +133,7 @@ use crate::connectors::data_storage::mysql::{MysqlReader, MysqlWriter};
 use crate::connectors::data_storage::nats;
 use crate::connectors::data_storage::pinecone::PineconeWriter;
 use crate::connectors::data_storage::pulsar::{
-    PulsarConnectionFactory, PulsarSchemaProvider, SchemaLookupError,
+    PulsarConnectionFactory, PulsarSchemaProvider, PulsarSubscriptionSpec, SchemaLookupError,
 };
 use crate::connectors::data_storage::qdrant::QdrantWriteError;
 use crate::connectors::data_storage::scanner::{FilesystemScanner, S3Scanner};
@@ -5312,7 +5313,7 @@ fn construct_pulsar_partition_reader(
         .filter(|(position, _)| position % effective_readers == worker_index)
         .map(|(_, partition)| *partition)
         .collect();
-    let reader = PulsarReader::new_with_partition_readers(
+    let mut reader = PulsarReader::new_with_partition_readers(
         runtime,
         client,
         arcstr::ArcStr::from(topic),
@@ -5324,39 +5325,12 @@ fn construct_pulsar_partition_reader(
         min_publish_timestamp_ms,
         with_metadata,
     );
+    if !is_static {
+        // A static read is defined by the snapshot taken at its start, so
+        // the partitions added later are outside of its message set anyway.
+        reader.watch_partition_count(num_partitions);
+    }
     Ok((Box::new(reader), effective_readers))
-}
-
-/// Creates the consumer of the subscription-based Pulsar reading mode: all
-/// the workers attach to one subscription of the requested type, positioned
-/// at the earliest or the latest message when the subscription doesn't exist
-/// yet.
-///
-/// The subscription is durable only when the user provided its name: a
-/// durable cursor survives the pipeline and pins the topic backlog on the
-/// broker, so it must belong to someone who manages its lifecycle. The
-/// auto-generated per-run names would leak one abandoned cursor per launch.
-fn build_pulsar_subscription_consumer(
-    runtime: &TokioRuntime,
-    client: &Pulsar<TokioExecutor>,
-    topic: &str,
-    subscription_name: &str,
-    subscription_type: PulsarSubType,
-    options: PulsarConsumerOptions,
-    worker_index: usize,
-) -> PyResult<pulsar::consumer::Consumer<Vec<u8>, TokioExecutor>> {
-    runtime.block_on(async {
-        client
-            .consumer()
-            .with_topic(topic)
-            .with_subscription(subscription_name)
-            .with_subscription_type(subscription_type)
-            .with_consumer_name(format!("pathway-worker-{worker_index}"))
-            .with_options(options)
-            .build()
-            .await
-            .map_err(|e| PyIOError::new_err(format!("Failed to create Pulsar consumer: {e}")))
-    })
 }
 
 /// Parses the streaming-mode subscription type from the Pulsar settings.
@@ -5499,6 +5473,20 @@ fn build_pulsar_client(
     settings: Option<&PulsarSettings>,
 ) -> PyResult<Pulsar<TokioExecutor>> {
     let mut builder = Pulsar::builder(uri, TokioExecutor);
+    // The client library retries the broker's "busy"/"not ready" answers
+    // (ProducerBusy, ConsumerBusy, ServiceNotReady) inside every operation,
+    // and its default budget is unlimited: a producer name held by another
+    // pipeline, or a second consumer of an exclusive subscription, would
+    // hang the pipeline forever with nothing but client-level warnings. A
+    // bounded budget turns a conflict that persists into a loud error
+    // (~2 minutes at the client's 5-second retry delay: enough for the
+    // broker to drop a crashed pipeline's lingering producer or consumer
+    // and for a broker restart to finish, in line with the writer's
+    // send-recovery budget).
+    builder = builder.with_operation_retry_options(PulsarOperationRetryOptions {
+        max_retries: Some(24),
+        ..PulsarOperationRetryOptions::default()
+    });
     if tls.client_cert_path.is_some() || tls.client_key_path.is_some() {
         return Err(PyValueError::new_err(
             "Mutual TLS (client certificate) authentication is not supported \
@@ -7565,6 +7553,20 @@ impl DataStorage {
             start_from_end,
         )?;
         if use_partition_readers {
+            if topic.starts_with("non-persistent://") {
+                // Normally rejected in Python for the static mode and the
+                // explicit reader mode; this also covers the persistence-
+                // implied choice of the mechanism. Without the check the
+                // reader spins in a broker-error loop for minutes before
+                // exhausting its error budget.
+                return Err(PyValueError::new_err(format!(
+                    "the non-persistent Pulsar topic '{topic}' cannot be read through \
+                     the partition-reader mechanism: it stores no messages, so there \
+                     are no positions to read from or replay. Use a persistent topic, \
+                     or the streaming mode with a subscription type (which cannot be \
+                     combined with persistence)",
+                )));
+            }
             if self.durable_consumer_name.is_some() {
                 warn!(
                     "The Pulsar reader for topic '{topic}' runs in the partition-reader mode, \
@@ -7659,6 +7661,11 @@ impl DataStorage {
         connector_index: usize,
     ) -> PyResult<Box<dyn ReaderBuilder>> {
         let client = self.pulsar_client(&runtime)?;
+        // The subscription is durable only when the user provided its name:
+        // a durable cursor survives the pipeline and pins the topic backlog
+        // on the broker, so it must belong to someone who manages its
+        // lifecycle. The auto-generated per-run names would leak one
+        // abandoned cursor per launch.
         let subscription_options = PulsarConsumerOptions::default()
             .durable(self.durable_consumer_name.is_some())
             .with_initial_position(if start_from_end {
@@ -7671,25 +7678,37 @@ impl DataStorage {
                     .as_ref()
                     .is_some_and(|settings| settings.read_compacted),
             );
-        let consumer = build_pulsar_subscription_consumer(
-            &runtime,
-            &client,
-            topic,
-            subscription_name,
+        // The reader recreates the consumer when its stream ends, so the
+        // consumer is built from the recipe the reader keeps.
+        let spec = PulsarSubscriptionSpec {
+            topic: topic.to_string(),
+            subscription_name: subscription_name.to_string(),
             subscription_type,
-            subscription_options,
-            worker_index,
-        )?;
-        let reader = PulsarReader::new_with_subscription(
+            consumer_name: format!("pathway-worker-{worker_index}"),
+            options: subscription_options,
+        };
+        // Counted before the consumer attaches: an expansion in the gap
+        // between the two would otherwise be baselined into the watch's
+        // initial count and never reported. In this order the same race
+        // degrades to a spurious expansion error at worst.
+        let num_partitions = runtime
+            .block_on(client.lookup_partitioned_topic_number(topic))
+            .map_err(|e| PyIOError::new_err(format!("Failed to look up the Pulsar topic: {e}")))?;
+        let consumer = runtime
+            .block_on(spec.build_consumer(&client))
+            .map_err(|e| PyIOError::new_err(format!("Failed to create Pulsar consumer: {e}")))?;
+        let mut reader = PulsarReader::new_with_subscription(
             runtime,
             client,
             consumer,
+            spec,
             arcstr::ArcStr::from(topic),
             worker_index,
             connector_index,
             min_publish_timestamp_ms,
             with_metadata,
         );
+        reader.watch_partition_count(num_partitions);
         Ok(Box::new(reader))
     }
 

@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::mem::take;
 use std::str::Utf8Error;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::{FutureExt, StreamExt};
 use pulsar::compression::Compression as PulsarCompression;
@@ -15,6 +15,7 @@ use pulsar::error::ConsumerError as PulsarConsumerError;
 use pulsar::message::proto::command_subscribe::SubType as PulsarSubType;
 use pulsar::producer::{Message as PulsarProducerMessage, SendFuture};
 use pulsar::proto::MessageIdData;
+use pulsar::routing_policy::RoutingPolicy as PulsarRoutingPolicy;
 use pulsar::{
     consumer::InitialPosition as PulsarInitialPosition, Producer, ProducerOptions, Pulsar,
     TokioExecutor,
@@ -80,6 +81,47 @@ const PRODUCER_BATCH_MAX_BYTES: usize = 128 * 1024;
 // in flight, the error is annotated with the likely cause.
 const PULSAR_DEFAULT_MAX_MESSAGE_SIZE: usize = 5 * 1024 * 1024;
 
+// How long the writer keeps retrying the sends whose failure is transient
+// (a dropped connection, a timed-out request) before giving up and failing
+// the pipeline. A broker blip — a failover, a bundle unload, a rolling
+// restart — heals well within this budget, so a streaming pipeline rides it
+// out instead of dying within a second of the disconnection, the way the
+// Kafka writer survives such blips through its client's delivery timeout.
+// The broker's definitive refusals (rejected credentials, a deleted topic)
+// and the oversized-message diagnosis are never retried.
+const SEND_RECOVERY_TOTAL_BUDGET: Duration = Duration::from_mins(2);
+
+// How long a single broker receipt may stay unresolved before its message
+// is considered undelivered and republished. A receipt can be lost without
+// an error when the connection dies at the wrong moment, and waiting
+// forever would hang the flush. A message whose receipt resolves after this
+// timeout may be delivered twice — the write contract is at-least-once.
+const SEND_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The cap of the backoff between the send-recovery attempts: the retries
+// must probe often enough to notice the broker healing within the budget.
+const SEND_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+// The byte cap of the writer's in-flight window. The writer retains a copy
+// of every unconfirmed message (see `PendingMessage`), so the count cap
+// alone would let large payloads hold gigabytes of retained copies.
+// Whichever cap is hit first triggers the backpressure drain, which then
+// frees down to the byte target below as well as to the count target.
+const MAX_IN_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const IN_FLIGHT_BYTES_DRAIN_TARGET: usize = MAX_IN_FLIGHT_BYTES / 2;
+
+// How long a terminal-class error of the subscription reading mode (a
+// poison message, a topic expansion) keeps surfacing within the ordinary
+// error budget before turning terminal. The messages acknowledged before
+// the error may sit in a minibatch the engine has not committed yet, and a
+// pipeline taken down at once drops them — irrecoverably, because the
+// broker's cursor is already past them. Every surfacing costs the connector
+// one error-backoff sleep, and the grace covers the default autocommit
+// interval (1500 ms) many times over; a pipeline configured with an
+// autocommit interval above the grace can still lose the tail — the
+// inherent risk of the ack-on-read mode.
+const TERMINAL_ERROR_COMMIT_GRACE: Duration = Duration::from_secs(10);
+
 // How many messages one runtime entry may take from the subscription
 // consumer. Entering the runtime (`block_on`) costs more than the
 // per-message processing itself, so the reader drains the consumer's locally
@@ -93,6 +135,17 @@ const MAX_READ_BATCH_SIZE: usize = 1000;
 // (and, through the consumers' flow permits, the broker's dispatch), which
 // is the desired backpressure.
 const PARTITION_PUMP_CHANNEL_CAPACITY: usize = 4096;
+
+// How often the reader re-checks the number of partitions of its topic.
+// Neither reading mechanism can attach to a partition that appeared after
+// the reader was positioned — the pumps are started once per partition, and
+// the client library's multi-topic consumer refreshes a list that already
+// holds the physical partition names — so a topic expanded under a running
+// pipeline must be reported instead of silently swallowing everything
+// published into the new partitions. The check is one lookup command, and
+// it also bounds how long the reader waits for messages, so an expansion is
+// noticed on an idle topic too.
+const PARTITION_COUNT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
 // How long a respawned pump waits before recreating its consumer. A pump is
 // only respawned after an error that has already exhausted the client's
@@ -141,6 +194,59 @@ pub enum PulsarError {
          connection when it receives an oversized frame"
     )]
     OversizedMessage { size: usize, source: pulsar::Error },
+
+    #[error(
+        "{undelivered} message(s) could not be delivered to the broker within the \
+         {budget:?} recovery budget: the connection kept failing for the whole \
+         window. The messages published before the failure may have reached the \
+         topic (the delivery is at-least-once)"
+    )]
+    SendRecoveryBudgetExhausted {
+        undelivered: usize,
+        budget: Duration,
+    },
+
+    #[error(
+        "the Pulsar topic '{topic}' contains an end-to-end encrypted message, and this \
+         reader cannot decrypt it — it would otherwise deliver the ciphertext as if it \
+         were the data. Read the topic with a consumer configured with the decryption \
+         keys, or publish without end-to-end encryption"
+    )]
+    EncryptedMessage { topic: String },
+
+    #[error(
+        "the Pulsar topic '{topic}' contains a chunked message (a message split into \
+         parts by a producer with chunking enabled), and this reader cannot reassemble \
+         the chunks — it would otherwise deliver meaningless fragments as separate \
+         rows. Publish without chunking (keep the messages under the broker's \
+         maxMessageSize), or read the topic with a chunking-aware consumer"
+    )]
+    ChunkedMessage { topic: String },
+
+    #[error(
+        "the Pulsar topic '{topic}' has been expanded from {old} to {new} partitions \
+         while the pipeline was running. The reader is attached to the {old} partitions \
+         the topic had at the start and cannot pick up the ones added later, so \
+         everything published into them would be skipped unnoticed. Restart the \
+         pipeline to read the expanded topic"
+    )]
+    TopicPartitionsExpanded { topic: String, old: u32, new: u32 },
+}
+
+impl PulsarError {
+    /// A copy of a data-fatal error, kept by the reader to resurface on the
+    /// later reads (the error type as a whole is not `Clone`).
+    fn clone_data_fatal(&self) -> PulsarError {
+        match self {
+            PulsarError::EncryptedMessage { topic } => PulsarError::EncryptedMessage {
+                topic: topic.clone(),
+            },
+            PulsarError::ChunkedMessage { topic } => PulsarError::ChunkedMessage {
+                topic: topic.clone(),
+            },
+            _ => panic!("only the data-fatal errors are kept for resurfacing"),
+        }
+    }
 }
 
 /// The position of a message within one partition: `(ledger_id, entry_id,
@@ -209,6 +315,51 @@ fn build_message_metadata(
     ))
 }
 
+/// The admission check of one incoming message, shared by both reading
+/// mechanisms so they can never diverge on it. `Ok(true)` — deliver.
+/// `Ok(false)` — below a `start_from="timestamp"` position, skipped
+/// silently; this deliberately also skips the poison checks, so an
+/// undeliverable era of the topic below the threshold does not kill a read
+/// positioned above it. `Err` — the message is within the delivered range
+/// but cannot be delivered faithfully: a chunked message is a fragment of a
+/// larger payload and an encrypted one is ciphertext, so the reader reports
+/// a terminal error instead of silently corrupting the data — the topic
+/// needs a client that can reassemble or decrypt, which this reader is not.
+fn admit_message(
+    proto_metadata: &pulsar::message::Metadata,
+    min_publish_timestamp_ms: Option<u64>,
+    topic: &str,
+) -> Result<bool, PulsarError> {
+    if min_publish_timestamp_ms.is_some_and(|t| proto_metadata.publish_time < t) {
+        return Ok(false);
+    }
+    if !proto_metadata.encryption_keys.is_empty() {
+        return Err(PulsarError::EncryptedMessage {
+            topic: topic.to_string(),
+        });
+    }
+    if proto_metadata.num_chunks_from_msg.is_some_and(|n| n > 1)
+        || proto_metadata.chunk_id.is_some()
+    {
+        return Err(PulsarError::ChunkedMessage {
+            topic: topic.to_string(),
+        });
+    }
+    Ok(true)
+}
+
+/// Whether a read error reports data this reader can never deliver
+/// faithfully (see [`admit_message`]). Such an error repeats
+/// on every retry, so it must take the pipeline down at once.
+fn read_error_is_fatal_for_data(error: &ReadError) -> bool {
+    matches!(
+        error,
+        ReadError::Pulsar(
+            PulsarError::EncryptedMessage { .. } | PulsarError::ChunkedMessage { .. }
+        )
+    )
+}
+
 /// What a partition pump task reports to the reader.
 enum PumpEvent {
     Message(PumpedMessage),
@@ -227,12 +378,49 @@ enum PumpEvent {
     },
 }
 
+/// Everything needed to create the consumer of the subscription mode. The
+/// reader keeps it so that it can recreate a consumer whose stream ended:
+/// the client library reconnects on its own only within its retry budget,
+/// and an outage that outlasts it (a broker restart, most commonly) leaves
+/// the stream exhausted for good. A reader attached to such a stream stays
+/// alive and delivers nothing, so it must build a new consumer instead.
+pub struct PulsarSubscriptionSpec {
+    pub topic: String,
+    pub subscription_name: String,
+    pub subscription_type: PulsarSubType,
+    pub consumer_name: String,
+    pub options: PulsarConsumerOptions,
+}
+
+impl PulsarSubscriptionSpec {
+    /// Builds a consumer of the subscription. Both the initial consumer and
+    /// the rebuilds after an exhausted stream go through this, so the two
+    /// can never diverge in their options.
+    pub async fn build_consumer(
+        &self,
+        client: &Pulsar<TokioExecutor>,
+    ) -> Result<PulsarConsumer<Vec<u8>, TokioExecutor>, pulsar::Error> {
+        client
+            .consumer()
+            .with_topic(&self.topic)
+            .with_subscription(&self.subscription_name)
+            .with_subscription_type(self.subscription_type)
+            .with_consumer_name(&self.consumer_name)
+            .with_options(self.options.clone())
+            .build()
+            .await
+    }
+}
+
 enum PulsarReaderMode {
     /// Streaming through a broker-side subscription. The subscription cursor
     /// is advanced by immediate acknowledgements, so this mode cannot
     /// guarantee lossless recovery and is not allowed with persistence.
     Subscription {
+        // `None` between the moment the consumer's stream ends and the
+        // rebuild the next read performs.
         consumer: Option<Box<PulsarConsumer<Vec<u8>, TokioExecutor>>>,
+        spec: Box<PulsarSubscriptionSpec>,
         preloaded: VecDeque<PreloadedMessage>,
     },
     /// A reader that never consumes anything. The engine constructs a reader
@@ -278,6 +466,16 @@ struct PartitionPump {
     join_handles: Vec<JoinHandle<()>>,
 }
 
+/// The background check of the topic's partition count (see
+/// [`PulsarError::TopicPartitionsExpanded`]). The task reports the new count
+/// once, when it first sees one above `initial_count`, and then ends.
+struct PartitionWatch {
+    initial_count: u32,
+    receiver: mpsc::Receiver<u32>,
+    // Dropped under `runtime.enter()` together with the runtime.
+    _handle: JoinHandle<()>,
+}
+
 #[allow(clippy::module_name_repetitions)]
 pub struct PulsarReader {
     runtime: TokioRuntime,
@@ -299,6 +497,27 @@ pub struct PulsarReader {
     // the data event waits here for the next `read` call — the same pattern
     // the Kafka and RabbitMQ readers use.
     deferred_read_result: Option<ReadResult>,
+    // Present in the streaming modes; a static read is defined by the
+    // snapshot taken at its start, so the partitions added later are outside
+    // of its message set by construction.
+    partition_watch: Option<PartitionWatch>,
+    // The count the watch reported, once it did. It makes the expansion
+    // error repeat on every subsequent read and turns it terminal (see
+    // `max_allowed_consecutive_errors`).
+    expanded_partition_count: Option<u32>,
+    // Set when the topic turns out to contain a message this reader can
+    // never deliver faithfully (chunked, encrypted): retrying meets the
+    // same message again, so the first such error is terminal.
+    fatal_data_error_seen: bool,
+    // A fatal data error met behind messages that were already acknowledged
+    // but not yet delivered. Failing at once would drop them — and the
+    // durable cursor is already past them on the broker — so the error is
+    // kept and resurfaces instead, non-terminally for
+    // `TERMINAL_ERROR_COMMIT_GRACE` (see `stage_terminal_error`).
+    deferred_fatal_error: Option<PulsarError>,
+    // When a terminal-class error of the subscription mode first surfaced;
+    // it turns terminal once the commit grace has elapsed.
+    terminal_error_first_surfaced: Option<Instant>,
     mode: PulsarReaderMode,
 }
 
@@ -308,6 +527,7 @@ impl PulsarReader {
         runtime: TokioRuntime,
         client: Pulsar<TokioExecutor>,
         consumer: PulsarConsumer<Vec<u8>, TokioExecutor>,
+        spec: PulsarSubscriptionSpec,
         base_topic: arcstr::ArcStr,
         worker_index: usize,
         connector_index: usize,
@@ -324,8 +544,14 @@ impl PulsarReader {
             min_publish_timestamp_ms,
             with_metadata,
             deferred_read_result: None,
+            partition_watch: None,
+            expanded_partition_count: None,
+            fatal_data_error_seen: false,
+            deferred_fatal_error: None,
+            terminal_error_first_surfaced: None,
             mode: PulsarReaderMode::Subscription {
                 consumer: Some(Box::new(consumer)),
+                spec: Box::new(spec),
                 preloaded: VecDeque::new(),
             },
         }
@@ -354,6 +580,11 @@ impl PulsarReader {
             min_publish_timestamp_ms,
             with_metadata,
             deferred_read_result: None,
+            partition_watch: None,
+            expanded_partition_count: None,
+            fatal_data_error_seen: false,
+            deferred_fatal_error: None,
+            terminal_error_first_surfaced: None,
             mode: PulsarReaderMode::PartitionReaders {
                 partitions,
                 static_mode,
@@ -381,8 +612,98 @@ impl PulsarReader {
             min_publish_timestamp_ms: None,
             with_metadata: false,
             deferred_read_result: None,
+            partition_watch: None,
+            expanded_partition_count: None,
+            fatal_data_error_seen: false,
+            deferred_fatal_error: None,
+            terminal_error_first_surfaced: None,
             mode: PulsarReaderMode::Idle,
         }
+    }
+
+    /// Starts the background check of the topic's partition count (see
+    /// [`PulsarError::TopicPartitionsExpanded`]). Called by the construction
+    /// sites of the streaming modes with the count the reader was positioned
+    /// on.
+    pub fn watch_partition_count(&mut self, initial_count: u32) {
+        let Some(client) = self.client.clone() else {
+            return; // the idle mode never reads
+        };
+        let topic = self.base_topic.to_string();
+        let (sender, receiver) = mpsc::channel(1);
+        let _guard = self.runtime.enter();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PARTITION_COUNT_CHECK_INTERVAL).await;
+                match Box::pin(client.lookup_partitioned_topic_number(&topic)).await {
+                    Ok(count) if count > initial_count => {
+                        let _ = sender.send(count).await;
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // A failed lookup says nothing about the topic; the
+                        // reading path reports the connection problems.
+                        warn!(
+                            "failed to check the partition count of the Pulsar topic \
+                             '{topic}': {error}"
+                        );
+                    }
+                }
+            }
+        });
+        self.partition_watch = Some(PartitionWatch {
+            initial_count,
+            receiver,
+            _handle: handle,
+        });
+    }
+
+    /// Marks one surfacing of a terminal-class error of the subscription
+    /// mode. The rows acknowledged ahead of the error may sit in a minibatch
+    /// the engine has not committed yet, and the broker's cursor is already
+    /// past them — so the error stays within the ordinary budget (each
+    /// surfacing costing one connector error backoff) until the commit grace
+    /// elapses, and only then turns terminal.
+    fn stage_terminal_error(&mut self) {
+        let first = *self
+            .terminal_error_first_surfaced
+            .get_or_insert_with(Instant::now);
+        if first.elapsed() >= TERMINAL_ERROR_COMMIT_GRACE {
+            self.fatal_data_error_seen = true;
+        }
+    }
+
+    /// Fails the read once the watch has seen the topic grow. Called before
+    /// the reader waits for messages — both to notice the expansion on an
+    /// idle topic and to keep it off the per-message path.
+    fn check_partition_count(&mut self) -> Result<(), ReadError> {
+        if let Some(watch) = &mut self.partition_watch {
+            if let Ok(new_count) = watch.receiver.try_recv() {
+                self.expanded_partition_count = Some(new_count);
+            }
+        }
+        if let Some(new) = self.expanded_partition_count {
+            if matches!(self.mode, PulsarReaderMode::Subscription { .. }) {
+                // The subscription consumer acknowledges on read, so an
+                // instantly terminal error would drop the acknowledged rows
+                // of an uncommitted minibatch (see `stage_terminal_error`).
+                // The partition-reader mode acknowledges nothing and stays
+                // instantly terminal (see
+                // `max_allowed_consecutive_errors`).
+                self.stage_terminal_error();
+            }
+            return Err(PulsarError::TopicPartitionsExpanded {
+                topic: self.base_topic.to_string(),
+                old: self
+                    .partition_watch
+                    .as_ref()
+                    .map_or(0, |watch| watch.initial_count),
+                new,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     fn physical_topic(base_topic: &str, partition: i32) -> String {
@@ -516,6 +837,58 @@ impl PulsarReader {
         }
     }
 
+    /// Waits for pump events and moves them into the pump's local buffer.
+    /// `Some(ReadResult)` short-circuits the read (the source is finished);
+    /// `None` means the buffer is non-empty and the caller proceeds.
+    fn refill_partition_pump(&mut self) -> Result<Option<ReadResult>, ReadError> {
+        // The check runs on every refill, i.e. at least once per
+        // `MAX_READ_BATCH_SIZE` messages: a busy topic must report its
+        // expansion no later than an idle one — the bounded wait below only
+        // covers the case of no messages at all.
+        self.check_partition_count()?;
+        let PulsarReaderMode::PartitionReaders { pump, .. } = &mut self.mode else {
+            unreachable!("checked by the caller");
+        };
+        let pump = pump.as_mut().expect("the pump is started by the caller");
+        if pump.remaining_static_partitions == Some(0) {
+            // Static mode: every partition is drained up to its boundary.
+            return Ok(Some(ReadResult::Finished));
+        }
+        let mut chunk = Vec::new();
+        // The wait is bounded while the partition count is watched, so an
+        // expansion is reported even when the partitions this reader owns
+        // stay silent. `recv_many` is cancel-safe: a timed-out wait has
+        // taken nothing off the channel.
+        let received = if self.partition_watch.is_some() {
+            // The timer is created inside the runtime: constructing it
+            // outside a reactor context panics.
+            let waited = self.runtime.block_on(async {
+                tokio::time::timeout(
+                    PARTITION_COUNT_CHECK_INTERVAL,
+                    pump.receiver.recv_many(&mut chunk, MAX_READ_BATCH_SIZE),
+                )
+                .await
+            });
+            match waited {
+                Ok(received) => received,
+                Err(_elapsed) => {
+                    self.check_partition_count()?;
+                    return Ok(None);
+                }
+            }
+        } else {
+            self.runtime
+                .block_on(pump.receiver.recv_many(&mut chunk, MAX_READ_BATCH_SIZE))
+        };
+        if received == 0 {
+            // Unreachable while the respawn sender is held; kept as a
+            // defensive exit instead of a busy loop.
+            return Ok(Some(ReadResult::Finished));
+        }
+        pump.buffered.extend(chunk);
+        Ok(None)
+    }
+
     fn read_from_partition_pump(&mut self) -> Result<ReadResult, ReadError> {
         if let PulsarReaderMode::PartitionReaders {
             partitions, pump, ..
@@ -534,6 +907,20 @@ impl PulsarReader {
             }
         }
         loop {
+            let refill_needed = {
+                let PulsarReaderMode::PartitionReaders { pump, .. } = &mut self.mode else {
+                    unreachable!("checked by the caller");
+                };
+                pump.as_mut()
+                    .expect("the pump is started above")
+                    .buffered
+                    .is_empty()
+            };
+            if refill_needed {
+                if let Some(read_result) = self.refill_partition_pump()? {
+                    return Ok(read_result);
+                }
+            }
             let PulsarReaderMode::PartitionReaders {
                 positions, pump, ..
             } = &mut self.mode
@@ -542,23 +929,10 @@ impl PulsarReader {
             };
             let pump = pump.as_mut().expect("the pump is started above");
             if pump.buffered.is_empty() {
-                if pump.remaining_static_partitions == Some(0) {
-                    // Static mode: every partition is drained up to its
-                    // boundary.
-                    return Ok(ReadResult::Finished);
-                }
-                let mut chunk = Vec::new();
-                let received = self
-                    .runtime
-                    .block_on(pump.receiver.recv_many(&mut chunk, MAX_READ_BATCH_SIZE));
-                if received == 0 {
-                    // Unreachable while the respawn sender is held; kept as
-                    // a defensive exit instead of a busy loop.
-                    return Ok(ReadResult::Finished);
-                }
-                pump.buffered.extend(chunk);
+                // The bounded wait of the refill timed out; try again.
+                continue;
             }
-            match pump.buffered.pop_front().expect("refilled above") {
+            match pump.buffered.pop_front().expect("checked to be non-empty") {
                 PumpEvent::Message(message) => {
                     positions.insert(message.partition, message.position);
                     self.total_entries_read += 1;
@@ -600,11 +974,76 @@ impl PulsarReader {
                     resume_after,
                     resolved_boundary,
                 } => {
-                    self.respawn_pump(partition, resume_after, resolved_boundary);
-                    return Err(error.into());
+                    let error: ReadError = error.into();
+                    if read_error_is_fatal_for_data(&error) {
+                        // A respawned pump would only meet the same message
+                        // again; the error budget drops to zero instead.
+                        self.fatal_data_error_seen = true;
+                    } else {
+                        self.respawn_pump(partition, resume_after, resolved_boundary);
+                    }
+                    return Err(error);
                 }
             }
         }
+    }
+
+    /// Builds the subscription consumer when the reader has none — at the
+    /// first read after the previous consumer's stream ended. The connector
+    /// loop's error backoff paces the attempts, so a broker that is still
+    /// down simply produces another read error.
+    fn ensure_subscription_consumer(&mut self) -> Result<(), ReadError> {
+        let PulsarReaderMode::Subscription { consumer, spec, .. } = &mut self.mode else {
+            unreachable!("checked by the caller");
+        };
+        if consumer.is_some() {
+            return Ok(());
+        }
+        let client = self
+            .client
+            .as_ref()
+            .expect("the subscription mode always owns a client");
+        let consequence = if spec.options.durable == Some(true) {
+            "a durable subscription resumes from its broker-side cursor, \
+             re-delivering at most the messages consumed since the cursor \
+             was last saved"
+        } else if matches!(spec.options.initial_position, PulsarInitialPosition::Latest) {
+            "a non-durable subscription has no cursor to resume from, and \
+             this one starts at the end of the topic: the messages published \
+             while the connection was down are SKIPPED"
+        } else {
+            "a non-durable subscription has no cursor to resume from, so it \
+             restarts at the beginning position and the already processed \
+             messages arrive again"
+        };
+        warn!(
+            "recreating the Pulsar consumer of the topic '{}': the previous one \
+             gave up reconnecting. Note that {consequence}",
+            spec.topic
+        );
+        let rebuilt = self
+            .runtime
+            .block_on(spec.build_consumer(client))
+            .map_err(PulsarError::from)?;
+        *consumer = Some(Box::new(rebuilt));
+        Ok(())
+    }
+
+    /// Detaches the exhausted consumer so that the next read builds a fresh
+    /// one, and reports the failure the connector's error budget accounts
+    /// for.
+    fn drop_exhausted_subscription_consumer(&mut self) -> ReadError {
+        {
+            // The consumer interacts with the async runtime when dropped.
+            let _guard = self.runtime.enter();
+            if let PulsarReaderMode::Subscription { consumer, .. } = &mut self.mode {
+                consumer.take();
+            }
+        }
+        PulsarError::StreamUnexpectedlyClosed {
+            topic: self.base_topic.to_string(),
+        }
+        .into()
     }
 
     /// Takes up to `MAX_READ_BATCH_SIZE` messages from the subscription
@@ -613,27 +1052,31 @@ impl PulsarReader {
     /// acknowledged immediately: this mode is never used with persistence,
     /// so there is no reason to defer the cursor advancement.
     fn refill_subscription_preloaded(&mut self) -> Result<(), ReadError> {
+        if let Some(error) = &self.deferred_fatal_error {
+            // Everything acknowledged ahead of the poison message — in this
+            // refill or the earlier ones — has been delivered by now. The
+            // broker will not redeliver the unacknowledged poison message to
+            // this live consumer, so the kept error resurfaces here instead —
+            // terminally, once the commit grace has passed (see
+            // `stage_terminal_error`).
+            let error = error.clone_data_fatal();
+            self.stage_terminal_error();
+            return Err(error.into());
+        }
+        self.ensure_subscription_consumer()?;
         let PulsarReaderMode::Subscription {
             consumer,
             preloaded,
+            ..
         } = &mut self.mode
         else {
             unreachable!("checked by the caller");
         };
-        let consumer = consumer.as_mut().expect("consumer is set until drop");
-        let base_topic = &self.base_topic;
+        let consumer = consumer.as_mut().expect("built above");
+        let base_topic = self.base_topic.to_string();
+        let min_publish_timestamp_ms = self.min_publish_timestamp_ms;
         let with_metadata = self.with_metadata;
-        // An exhausted consumer stream is never a normal end of data in the
-        // subscription mode: the topic is unbounded. It means the client gave
-        // up — most likely it exhausted its reconnection attempts during a
-        // broker outage — so it must surface as an error, not as `Finished`:
-        // otherwise a streaming pipeline would silently "complete" and ignore
-        // all the data published after the broker recovers.
-        let stream_closed = || {
-            ReadError::from(PulsarError::StreamUnexpectedlyClosed {
-                topic: base_topic.to_string(),
-            })
-        };
+        let mut deferred: Option<PulsarError> = None;
         let preload_message = |message: pulsar::consumer::Message<Vec<u8>>| -> PreloadedMessage {
             let mut proto_metadata = message.payload.metadata;
             let metadata = with_metadata.then(|| {
@@ -646,11 +1089,40 @@ impl PulsarReader {
                 metadata,
             }
         };
-        self.runtime.block_on(async {
-            let Some(first_message) = consumer.next().await else {
-                return Err(stream_closed());
+        // The wait for the first message is bounded while the partition
+        // count is watched, so an expansion is noticed on an idle topic too;
+        // the caller re-checks it and returns without progress.
+        let watching = self.partition_watch.is_some();
+        // An exhausted consumer stream is never a normal end of data here:
+        // the topic is unbounded, so it means the client gave up. `false`
+        // reports it, and the consumer is replaced outside of this borrow —
+        // reporting `Finished` instead would let a streaming pipeline
+        // silently "complete" and ignore everything published afterwards.
+        let stream_alive = self.runtime.block_on(async {
+            let first_message = if watching {
+                match tokio::time::timeout(PARTITION_COUNT_CHECK_INTERVAL, consumer.next()).await {
+                    Ok(message) => message,
+                    Err(_elapsed) => return Ok(true),
+                }
+            } else {
+                consumer.next().await
+            };
+            let Some(first_message) = first_message else {
+                return Ok(false);
             };
             let first_message = first_message.map_err(PulsarError::from)?;
+            if let Err(error) = admit_message(
+                &first_message.payload.metadata,
+                min_publish_timestamp_ms,
+                &base_topic,
+            ) {
+                // Deferred rather than returned (see below): the messages
+                // acknowledged by the earlier refills may still sit in an
+                // uncommitted minibatch, which an instantly terminal error
+                // would drop.
+                deferred = Some(error);
+                return Ok(true);
+            }
             consumer
                 .ack(&first_message)
                 .await
@@ -659,14 +1131,43 @@ impl PulsarReader {
             while preloaded.len() < MAX_READ_BATCH_SIZE {
                 let message = match consumer.next().now_or_never() {
                     None => break,
-                    Some(None) => return Err(stream_closed()),
+                    Some(None) => return Ok(false),
                     Some(Some(message)) => message.map_err(PulsarError::from)?,
                 };
+                if let Err(error) = admit_message(
+                    &message.payload.metadata,
+                    min_publish_timestamp_ms,
+                    &base_topic,
+                ) {
+                    // The messages preloaded above are already acknowledged:
+                    // the broker's cursor is past them, so they must reach
+                    // the engine before this error kills the pipeline. The
+                    // poison message itself is left unacknowledged.
+                    deferred = Some(error);
+                    break;
+                }
                 consumer.ack(&message).await.map_err(PulsarError::from)?;
                 preloaded.push_back(preload_message(message));
             }
+            Ok::<bool, ReadError>(true)
+        });
+        let stream_alive = match stream_alive {
+            Ok(alive) => alive,
+            Err(error) => {
+                if read_error_is_fatal_for_data(&error) {
+                    self.fatal_data_error_seen = true;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(error) = deferred {
+            self.deferred_fatal_error = Some(error);
+        }
+        if stream_alive {
             Ok(())
-        })
+        } else {
+            Err(self.drop_exhausted_subscription_consumer())
+        }
     }
 
     fn read_from_subscription(&mut self) -> Result<ReadResult, ReadError> {
@@ -675,6 +1176,7 @@ impl PulsarReader {
                 unreachable!("checked by the caller");
             };
             let Some(message) = preloaded.pop_front() else {
+                self.check_partition_count()?;
                 self.refill_subscription_preloaded()?;
                 continue;
             };
@@ -765,6 +1267,42 @@ async fn pump_partition(
     }
 }
 
+/// Builds the exclusive non-durable consumer of one partition pump,
+/// positioned right after `start_after` when a delivery watermark exists.
+async fn build_pump_consumer(
+    client: &Pulsar<TokioExecutor>,
+    physical_topic: &str,
+    subscription_name: String,
+    partition: i32,
+    start_from_latest: bool,
+    start_after: Option<MessagePosition>,
+) -> Result<PulsarConsumer<Vec<u8>, TokioExecutor>, PulsarError> {
+    let mut options = PulsarConsumerOptions::default()
+        .durable(false)
+        .with_initial_position(if start_from_latest {
+            PulsarInitialPosition::Latest
+        } else {
+            PulsarInitialPosition::Earliest
+        });
+    if let Some((ledger_id, entry_id, batch_index)) = start_after {
+        options = options.starting_on_message(MessageIdData {
+            ledger_id,
+            entry_id,
+            batch_index: (batch_index >= 0).then_some(batch_index),
+            partition: (partition >= 0).then_some(partition),
+            ..MessageIdData::default()
+        });
+    }
+    Ok(client
+        .consumer()
+        .with_topic(physical_topic)
+        .with_subscription(subscription_name)
+        .with_subscription_type(PulsarSubType::Exclusive)
+        .with_options(options)
+        .build()
+        .await?)
+}
+
 /// The position of the last existing message of the partition, or `None`
 /// if the partition is empty (`entry_id == u64::MAX` is the broker's
 /// encoding of `entryId = -1`).
@@ -798,30 +1336,15 @@ async fn pump_partition_inner(
     if static_mode && start_from_latest {
         return Ok(());
     }
-    let mut options = PulsarConsumerOptions::default()
-        .durable(false)
-        .with_initial_position(if start_from_latest {
-            PulsarInitialPosition::Latest
-        } else {
-            PulsarInitialPosition::Earliest
-        });
-    if let Some((ledger_id, entry_id, batch_index)) = *watermark {
-        options = options.starting_on_message(MessageIdData {
-            ledger_id,
-            entry_id,
-            batch_index: (batch_index >= 0).then_some(batch_index),
-            partition: (partition >= 0).then_some(partition),
-            ..MessageIdData::default()
-        });
-    }
-    let mut consumer: PulsarConsumer<Vec<u8>, TokioExecutor> = client
-        .consumer()
-        .with_topic(physical_topic)
-        .with_subscription(subscription_name)
-        .with_subscription_type(PulsarSubType::Exclusive)
-        .with_options(options)
-        .build()
-        .await?;
+    let mut consumer = build_pump_consumer(
+        &client,
+        physical_topic,
+        subscription_name,
+        partition,
+        start_from_latest,
+        *watermark,
+    )
+    .await?;
 
     if start_from_latest && watermark.is_none() {
         // Resolve "end" into a concrete position exactly once, at the first
@@ -900,9 +1423,11 @@ async fn pump_partition_inner(
             // the fixed message set of this run.
             return Ok(());
         }
-        let filtered_out =
-            min_publish_timestamp_ms.is_some_and(|t| message.payload.metadata.publish_time < t);
-        if !filtered_out {
+        if admit_message(
+            &message.payload.metadata,
+            min_publish_timestamp_ms,
+            physical_topic,
+        )? {
             let mut proto_metadata = message.payload.metadata;
             let metadata = with_metadata.then(|| {
                 build_message_metadata(physical_topic, &message.message_id.id, &mut proto_metadata)
@@ -994,6 +1519,19 @@ impl Reader for PulsarReader {
     }
 
     fn max_allowed_consecutive_errors(&self) -> usize {
+        // A topic expanded under a running pipeline never heals by itself,
+        // and every retry is a stretch of time during which the messages of
+        // the new partitions are dropped: it takes the pipeline down at
+        // once in the partition-reader mode, unlike the transient broker
+        // problems the budget is for. In the subscription mode both the
+        // expansion and the poison-message errors pass through the commit
+        // grace first (see `stage_terminal_error`), which sets
+        // `fatal_data_error_seen` when the grace is over.
+        let expansion_instantly_terminal = self.expanded_partition_count.is_some()
+            && !matches!(self.mode, PulsarReaderMode::Subscription { .. });
+        if self.fatal_data_error_seen || expansion_instantly_terminal {
+            return 0;
+        }
         32
     }
 
@@ -1008,6 +1546,7 @@ impl Drop for PulsarReader {
         // when dropped, so they are dropped explicitly under the runtime
         // context.
         let _guard = self.runtime.enter();
+        self.partition_watch.take();
         match &mut self.mode {
             PulsarReaderMode::Subscription { consumer, .. } => {
                 consumer.take();
@@ -1016,6 +1555,61 @@ impl Drop for PulsarReader {
                 pump.take();
             }
             PulsarReaderMode::Idle => {}
+        }
+    }
+}
+
+/// The retained copy of one in-flight message: everything needed to publish
+/// it again when its receipt reports a transient failure. The client library
+/// consumes the message on send and drops its internal copy with the broken
+/// connection, so without this copy the only possible answer to such a
+/// failure is failing the whole pipeline (see `SEND_RECOVERY_TOTAL_BUDGET`).
+#[derive(Clone)]
+struct PendingMessage {
+    // Shared, not owned: one minibatch retains tens of thousands of copies
+    // of the same topic name.
+    topic: arcstr::ArcStr,
+    payload: Vec<u8>,
+    properties: HashMap<String, String>,
+    partition_key: Option<String>,
+    ordering_key: Option<Vec<u8>>,
+    event_time: Option<u64>,
+}
+
+impl PendingMessage {
+    fn to_message(&self) -> PulsarProducerMessage {
+        PulsarProducerMessage {
+            payload: self.payload.clone(),
+            properties: self.properties.clone(),
+            partition_key: self.partition_key.clone(),
+            ordering_key: self.ordering_key.clone(),
+            event_time: self.event_time,
+            ..PulsarProducerMessage::default()
+        }
+    }
+}
+
+/// Retries `operation` on transient failures with a backoff capped at
+/// [`SEND_RECOVERY_MAX_BACKOFF`] until `deadline`. The broker's definitive
+/// refusals ([`pulsar_error_is_permanent`]) and the deadline end the retries
+/// with the last error; `describe` names the operation in the warnings.
+async fn retry_transient_pulsar_errors<T>(
+    deadline: Instant,
+    describe: impl Fn() -> String,
+    mut operation: impl AsyncFnMut() -> Result<T, pulsar::Error>,
+) -> Result<T, pulsar::Error> {
+    let mut backoff = RetryConfig::default();
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if pulsar_error_is_permanent(&error) || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                let delay = backoff.next_delay().min(SEND_RECOVERY_MAX_BACKOFF);
+                warn!("{}, retrying in {delay:?}: {error}", describe());
+                tokio::time::sleep(delay).await;
+            }
         }
     }
 }
@@ -1030,7 +1624,22 @@ pub struct PulsarWriter {
     // panics if the thread is not inside one, so the map is dropped
     // explicitly under `runtime.enter()` (see the `Drop` impl below).
     producers: Option<HashMap<String, Producer<TokioExecutor>>>,
-    in_flight: VecDeque<SendFuture>,
+    in_flight: VecDeque<(SendFuture, PendingMessage)>,
+    // The payload bytes of the in-flight queue, so the backpressure can cap
+    // the retained copies by size as well as by count (see
+    // `MAX_IN_FLIGHT_BYTES`).
+    in_flight_bytes: usize,
+    // The retained copies a failed recovery could not confirm. The engine
+    // retries a failed `write` per row, so these must be republished by the
+    // retried call before anything else — dropping them would silently lose
+    // every message of the failed recovery except the retried row itself.
+    unconfirmed: VecDeque<PendingMessage>,
+    // The topics whose producer failed to build with a permanent error,
+    // mapped to the error text. The engine retries a failed `write` a few
+    // times; without this cache every retry would sit through the client's
+    // full internal retry budget (about two minutes for a taken producer
+    // name) before repeating the same verdict.
+    permanent_producer_failures: HashMap<String, String>,
     // The largest payload submitted since the in-flight queue was last
     // empty. Used to annotate a failed send with the oversized-message
     // diagnosis (see `PULSAR_DEFAULT_MAX_MESSAGE_SIZE`).
@@ -1091,6 +1700,9 @@ impl PulsarWriter {
             client,
             producers: Some(HashMap::new()),
             in_flight: VecDeque::new(),
+            in_flight_bytes: 0,
+            unconfirmed: VecDeque::new(),
+            permanent_producer_failures: HashMap::new(),
             max_pending_payload_bytes: 0,
             topic,
             header_fields,
@@ -1105,6 +1717,9 @@ impl PulsarWriter {
     }
 
     fn ensure_producer(&mut self, topic: &str) -> Result<(), WriteError> {
+        if let Some(reason) = self.permanent_producer_failures.get(topic) {
+            return Err(PulsarError::Client(pulsar::Error::Custom(reason.clone())).into());
+        }
         let producers = self
             .producers
             .as_mut()
@@ -1128,6 +1743,13 @@ impl PulsarWriter {
                         // `SlowDown` when the client's outbound channel
                         // is full.
                         block_queue_if_full: true,
+                        // Route by the hash of the partition key, the way
+                        // the other Pulsar clients do by default. Without
+                        // an explicit policy the library round-robins every
+                        // message across the partitions and ignores the key
+                        // entirely, so the updates of one row would scatter
+                        // over the topic and lose their order.
+                        routing_policy: Some(PulsarRoutingPolicy::RoundRobin),
                         compression: self.compression.clone(),
                         schema,
                         ..ProducerOptions::default()
@@ -1135,43 +1757,254 @@ impl PulsarWriter {
             if let Some(producer_name) = &self.producer_name {
                 builder = builder.with_name(producer_name);
             }
-            let producer = self
-                .runtime
-                .block_on(builder.build())
-                .map_err(PulsarError::from)?;
+            // A transient failure to build the producer (the broker is
+            // momentarily unreachable) is retried within the same budget as
+            // the sends, so a blip at the first write of a topic does not
+            // take the pipeline down either.
+            let producer = self.runtime.block_on(retry_transient_pulsar_errors(
+                Instant::now() + SEND_RECOVERY_TOTAL_BUDGET,
+                || format!("transient failure to create a Pulsar producer for the topic '{topic}'"),
+                async || Box::pin(builder.clone().build()).await,
+            ));
+            let producer = match producer {
+                Ok(producer) => producer,
+                Err(error) => {
+                    if pulsar_error_is_permanent(&error) {
+                        self.permanent_producer_failures
+                            .insert(topic.to_string(), error.to_string());
+                    }
+                    return Err(PulsarError::from(error).into());
+                }
+            };
             producers.insert(topic.to_string(), producer);
         }
         Ok(())
     }
 
+    /// Publishes one retained message, retrying the transient failures with
+    /// backoff until `deadline`, and returns its receipt future.
+    async fn send_pending_message(
+        producers: &mut HashMap<String, Producer<TokioExecutor>>,
+        message: &PendingMessage,
+        deadline: Instant,
+        max_pending_payload_bytes: usize,
+    ) -> Result<SendFuture, WriteError> {
+        retry_transient_pulsar_errors(
+            deadline,
+            || {
+                format!(
+                    "transient failure to publish a message to the Pulsar topic '{}'",
+                    message.topic
+                )
+            },
+            async || {
+                let producer = producers
+                    .get_mut(message.topic.as_str())
+                    .expect("the producer of an in-flight topic exists");
+                Box::pin(producer.send_non_blocking(message.to_message())).await
+            },
+        )
+        .await
+        .map_err(|error| Self::annotate_send_error(error, max_pending_payload_bytes).into())
+    }
+
     // Awaits broker receipts, oldest first, until at most `limit` sends
     // remain in flight. Used both to apply backpressure in `write` and to
-    // drain everything in `flush`. Partially filled batches are forced out
-    // first: a receipt for a message sitting in an unfilled batch would
-    // otherwise never resolve.
+    // drain everything in `flush`.
+    //
+    // A receipt that reports a transient failure (or does not arrive within
+    // `SEND_RECEIPT_TIMEOUT`) does not fail the pipeline: the message is
+    // republished from its retained copy and the drain restarts, for up to
+    // `SEND_RECOVERY_TOTAL_BUDGET` — a broker blip mid-write heals instead
+    // of killing the run. When the recovery fails anyway, the retained
+    // copies stay in `unconfirmed` and the next call republishes them
+    // first: the engine retries a failed `write` per row, and without the
+    // retained copies the retried call would confirm only its own row,
+    // silently losing the rest of the failed recovery's messages. A message
+    // whose dropped receipt would still have resolved may be delivered
+    // twice this way — the write contract is at-least-once.
     async fn drain_in_flight(
         producers: &mut HashMap<String, Producer<TokioExecutor>>,
-        in_flight: &mut VecDeque<SendFuture>,
+        in_flight: &mut VecDeque<(SendFuture, PendingMessage)>,
+        unconfirmed: &mut VecDeque<PendingMessage>,
+        in_flight_bytes: &mut usize,
         max_pending_payload_bytes: &mut usize,
         limit: usize,
+        byte_limit: usize,
     ) -> Result<(), WriteError> {
-        if in_flight.len() > limit {
-            let annotate =
-                |error: pulsar::Error| Self::annotate_send_error(error, *max_pending_payload_bytes);
-            for producer in producers.values_mut() {
-                producer.send_batch().await.map_err(annotate)?;
+        let result = if !unconfirmed.is_empty()
+            || in_flight.len() > limit
+            || *in_flight_bytes > byte_limit
+        {
+            let result = Self::drain_in_flight_inner(
+                producers,
+                in_flight,
+                unconfirmed,
+                in_flight_bytes,
+                *max_pending_payload_bytes,
+                limit,
+                byte_limit,
+            )
+            .await;
+            if result.is_err() {
+                unconfirmed.extend(in_flight.drain(..).map(|(_, message)| message));
+                *in_flight_bytes = 0;
             }
-            while in_flight.len() > limit {
-                let send_future = in_flight
-                    .pop_front()
-                    .expect("in_flight is non-empty while its length exceeds the limit");
-                send_future.await.map_err(annotate)?;
-            }
-        }
-        if in_flight.is_empty() {
+            result
+        } else {
+            Ok(())
+        };
+        if in_flight.is_empty() && unconfirmed.is_empty() {
             *max_pending_payload_bytes = 0;
         }
-        Ok(())
+        result
+    }
+
+    // The rounds of the drain: republish the retained copies, force the
+    // partial batches out (a receipt for a message sitting in an unfilled
+    // batch would otherwise never resolve), await the receipts. Once any
+    // trouble is seen, the drain empties the whole queue rather than
+    // stopping at `limit`, so the recovery ends with every republished
+    // message confirmed.
+    async fn drain_in_flight_inner(
+        producers: &mut HashMap<String, Producer<TokioExecutor>>,
+        in_flight: &mut VecDeque<(SendFuture, PendingMessage)>,
+        unconfirmed: &mut VecDeque<PendingMessage>,
+        in_flight_bytes: &mut usize,
+        max_pending_payload_bytes: usize,
+        limit: usize,
+        byte_limit: usize,
+    ) -> Result<(), WriteError> {
+        let deadline = Instant::now() + SEND_RECOVERY_TOTAL_BUDGET;
+        let mut backoff = RetryConfig::default();
+        let mut ever_troubled = !unconfirmed.is_empty();
+        loop {
+            while let Some(message) = unconfirmed.pop_front() {
+                match Self::send_pending_message(
+                    producers,
+                    &message,
+                    deadline,
+                    max_pending_payload_bytes,
+                )
+                .await
+                {
+                    Ok(send_future) => {
+                        *in_flight_bytes += message.payload.len();
+                        in_flight.push_back((send_future, message));
+                    }
+                    Err(error) => {
+                        unconfirmed.push_front(message);
+                        return Err(error);
+                    }
+                }
+            }
+            let mut round_troubled = false;
+            // A transient failure to force a batch out is not final: the
+            // receipts of the affected messages fail or time out below, and
+            // the messages are republished.
+            for producer in producers.values_mut() {
+                if let Err(error) = producer.send_batch().await {
+                    if pulsar_error_is_permanent(&error) {
+                        return Err(
+                            Self::annotate_send_error(error, max_pending_payload_bytes).into()
+                        );
+                    }
+                    warn!("failed to flush a Pulsar producer batch, recovering: {error}");
+                    round_troubled = true;
+                }
+            }
+            loop {
+                let (count_target, byte_target) = if ever_troubled || round_troubled {
+                    (0, 0)
+                } else {
+                    (limit, byte_limit)
+                };
+                if in_flight.len() <= count_target && *in_flight_bytes <= byte_target {
+                    break;
+                }
+                let (send_future, message) = in_flight
+                    .pop_front()
+                    .expect("in_flight is non-empty while a target is exceeded");
+                *in_flight_bytes -= message.payload.len();
+                // Capped by the recovery deadline: the receipt waits are
+                // sequential, and without the cap a queue of receipts lost
+                // to one dead connection would hold the flush far beyond
+                // the budget — thousands of thirty-second waits.
+                let wait =
+                    SEND_RECEIPT_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+                match tokio::time::timeout(wait, send_future).await {
+                    Ok(Ok(_receipt)) => {}
+                    Ok(Err(error)) => {
+                        if pulsar_error_is_permanent(&error) {
+                            unconfirmed.push_back(message);
+                            return Err(Self::annotate_send_error(
+                                error,
+                                max_pending_payload_bytes,
+                            )
+                            .into());
+                        }
+                        warn!(
+                            "a Pulsar broker receipt reported a transient failure, \
+                             republishing the message: {error}"
+                        );
+                        round_troubled = true;
+                        unconfirmed.push_back(message);
+                    }
+                    Err(_elapsed) => {
+                        // Most likely lost together with a dropped
+                        // connection. If it was in fact delivered, the
+                        // republication duplicates the message — the write
+                        // contract is at-least-once.
+                        warn!(
+                            "a Pulsar broker receipt did not arrive within {wait:?}, \
+                             republishing the message"
+                        );
+                        round_troubled = true;
+                        unconfirmed.push_back(message);
+                    }
+                }
+            }
+            if !round_troubled {
+                // A full round without a new failure: everything above the
+                // limit (or, after any trouble, everything at all) is
+                // confirmed by the broker.
+                return Ok(());
+            }
+            ever_troubled = true;
+            // An oversized payload in flight never shortens the recovery:
+            // the broker's message-size limit is configurable and the client
+            // library does not report it, so the suspicion cannot be told
+            // from a transient blip on a permissive broker. A genuinely
+            // oversized payload burns the whole budget and gets the
+            // diagnosis attached to the terminal error (see
+            // `recovery_gave_up_error`).
+            if Instant::now() >= deadline {
+                return Err(Self::recovery_gave_up_error(
+                    unconfirmed.len() + in_flight.len(),
+                    max_pending_payload_bytes,
+                )
+                .into());
+            }
+            tokio::time::sleep(backoff.next_delay().min(SEND_RECOVERY_MAX_BACKOFF)).await;
+        }
+    }
+
+    /// The terminal error of a recovery that ends with unconfirmed messages:
+    /// the oversized-payload diagnosis when it applies (see
+    /// `annotate_send_error`), the plain budget report otherwise.
+    fn recovery_gave_up_error(undelivered: usize, max_pending_payload_bytes: usize) -> PulsarError {
+        if max_pending_payload_bytes > PULSAR_DEFAULT_MAX_MESSAGE_SIZE {
+            return Self::annotate_send_error(
+                pulsar::Error::Custom(format!(
+                    "{undelivered} message(s) could not be delivered to the broker"
+                )),
+                max_pending_payload_bytes,
+            );
+        }
+        PulsarError::SendRecoveryBudgetExhausted {
+            undelivered,
+            budget: SEND_RECOVERY_TOTAL_BUDGET,
+        }
     }
 
     // A send failure while an oversized payload is in flight is almost
@@ -1271,12 +2104,16 @@ impl Writer for PulsarWriter {
             runtime,
             producers,
             in_flight,
+            in_flight_bytes,
+            unconfirmed,
             max_pending_payload_bytes,
             ..
         } = self;
         let producers = producers.as_mut().expect("producers are set until drop");
+        let effective_topic = arcstr::ArcStr::from(effective_topic);
 
         runtime.block_on(async {
+            let deadline = Instant::now() + SEND_RECOVERY_TOTAL_BUDGET;
             let last_payload_index = data.payloads.len() - 1;
             for (index, payload) in data.payloads.into_iter().enumerate() {
                 // Avoid copying data on the last iteration, reuse the existing properties
@@ -1287,32 +2124,40 @@ impl Writer for PulsarWriter {
                         properties.clone()
                     }
                 };
-                if in_flight.len() >= MAX_IN_FLIGHT_SENDS {
+                if in_flight.len() >= MAX_IN_FLIGHT_SENDS
+                    || *in_flight_bytes >= MAX_IN_FLIGHT_BYTES
+                    || !unconfirmed.is_empty()
+                {
                     Self::drain_in_flight(
                         producers,
                         in_flight,
+                        unconfirmed,
+                        in_flight_bytes,
                         max_pending_payload_bytes,
                         IN_FLIGHT_DRAIN_TARGET,
+                        IN_FLIGHT_BYTES_DRAIN_TARGET,
                     )
                     .await?;
                 }
                 let payload = payload.into_raw_bytes()?;
                 *max_pending_payload_bytes = (*max_pending_payload_bytes).max(payload.len());
-                let message = PulsarProducerMessage {
+                let message = PendingMessage {
+                    topic: effective_topic.clone(),
                     payload,
                     properties,
                     partition_key: Some(partition_key.clone()),
                     ordering_key: ordering_key.clone(),
                     event_time,
-                    ..PulsarProducerMessage::default()
                 };
-                let producer = producers
-                    .get_mut(&effective_topic)
-                    .expect("the producer is created by ensure_producer above");
-                let send_future = Box::pin(producer.send_non_blocking(message))
-                    .await
-                    .map_err(|e| Self::annotate_send_error(e, *max_pending_payload_bytes))?;
-                in_flight.push_back(send_future);
+                let send_future = Self::send_pending_message(
+                    producers,
+                    &message,
+                    deadline,
+                    *max_pending_payload_bytes,
+                )
+                .await?;
+                *in_flight_bytes += message.payload.len();
+                in_flight.push_back((send_future, message));
             }
             Ok(())
         })
@@ -1323,6 +2168,8 @@ impl Writer for PulsarWriter {
             runtime,
             producers,
             in_flight,
+            in_flight_bytes,
+            unconfirmed,
             max_pending_payload_bytes,
             ..
         } = self;
@@ -1336,7 +2183,16 @@ impl Writer for PulsarWriter {
         // The send pipelining happens inside `write` instead (see
         // MAX_IN_FLIGHT_SENDS), where no commit point can interleave.
         runtime.block_on(async {
-            Self::drain_in_flight(producers, in_flight, max_pending_payload_bytes, 0).await
+            Self::drain_in_flight(
+                producers,
+                in_flight,
+                unconfirmed,
+                in_flight_bytes,
+                max_pending_payload_bytes,
+                0,
+                0,
+            )
+            .await
         })
     }
 
@@ -1379,6 +2235,11 @@ fn pulsar_error_is_permanent(error: &pulsar::Error) -> bool {
                 | ServerError::NotAllowedError
                 | ServerError::IncompatibleSchema
                 | ServerError::TopicTerminatedError
+                // Reaches this classification only after the client has
+                // already retried it for its whole internal budget (see
+                // `build_pulsar_client`), so by now the name is genuinely
+                // held by a live producer of another pipeline.
+                | ServerError::ProducerBusy
         )
     }
     fn connection_error_is_permanent(error: &ConnectionError) -> bool {

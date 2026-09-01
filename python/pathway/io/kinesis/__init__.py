@@ -17,6 +17,7 @@ from pathway.io._utils import (
     _get_unique_name,
     check_raw_and_plaintext_only_kwargs_for_message_queues,
     construct_schema_and_data_format,
+    remap_sort_by,
 )
 
 
@@ -383,6 +384,9 @@ def write(
         topic_name=stream_name if isinstance(stream_name, ColumnReference) else None,
         allowed_key_types=None,
     )
+    # The sink is attached to the table `construct` rebuilt, so the
+    # sort_by references taken against the original one are remapped.
+    sort_by = remap_sort_by(sort_by, table, output_format.table, "pw.io.kinesis.write")
     table = output_format.table
 
     data_storage = api.DataStorage(
