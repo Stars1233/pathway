@@ -146,3 +146,37 @@ fn test_float() {
 
     assert_failure(Value::Float(42.5.into()), &Type::TEXT);
 }
+
+#[test]
+fn test_scalars_to_jsonb() {
+    for json_type in [Type::JSONB, Type::JSON] {
+        assert_success(
+            Value::Float(42.5.into()),
+            &json_type,
+            serde_json::json!(42.5),
+        );
+        assert_success(Value::Bool(true), &json_type, serde_json::json!(true));
+        assert_success(Value::Bool(false), &json_type, serde_json::json!(false));
+        assert_success(
+            Value::String("foo".into()),
+            &json_type,
+            serde_json::json!("foo"),
+        );
+        // a string holding a JSON document stays a JSON string, not a document
+        assert_success(
+            Value::String("{\"a\": 1}".into()),
+            &json_type,
+            serde_json::json!("{\"a\": 1}"),
+        );
+        assert_success(
+            Value::String("123".into()),
+            &json_type,
+            serde_json::json!("123"),
+        );
+    }
+
+    // non-finite floats are not representable in JSON
+    assert_failure(Value::Float(f64::NAN.into()), &Type::JSONB);
+    assert_failure(Value::Float(f64::INFINITY.into()), &Type::JSONB);
+    assert_failure(Value::Float(f64::NEG_INFINITY.into()), &Type::JSONB);
+}

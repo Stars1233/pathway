@@ -839,6 +839,22 @@ mod to_sql {
             #[allow(clippy::cast_possible_truncation)]
             let f32_val = f as f32;
             try_forward!(f32, f32_val);
+            // A finite f64 is a valid JSON value. NaN and the infinities
+            // are not representable in JSON (PostgreSQL rejects them for
+            // jsonb as well), so they get an explicit error instead of
+            // the generic type-mismatch fallthrough.
+            if <serde_json::Value as ToSql>::accepts(ty) {
+                let Some(number) = serde_json::Number::from_f64(f) else {
+                    return Some(Err(format!(
+                        "cannot represent non-finite float {f} as a JSON value"
+                    )
+                    .into()));
+                };
+                let value = serde_json::Value::Number(number);
+                assert!(matches!(self.encode_format(ty), Format::Binary));
+                assert!(matches!(value.encode_format(ty), Format::Binary));
+                return Some(value.to_sql(ty, out));
+            }
             None
         }
 
@@ -925,6 +941,11 @@ mod to_sql {
                 Self::None => return Ok(IsNull::Yes),
                 Self::Bool(b) => {
                     try_forward!(bool, *b);
+                    if <serde_json::Value as ToSql>::accepts(ty) {
+                        let value = serde_json::Value::Bool(*b);
+                        assert!(matches!(value.encode_format(ty), Format::Binary));
+                        return value.to_sql(ty, out);
+                    }
                     "bool"
                 }
                 Self::Int(i) => {
@@ -944,6 +965,18 @@ mod to_sql {
                     "pointer"
                 }
                 Self::String(s) => {
+                    // A Pathway string maps to the JSON *string* value in a
+                    // JSON / JSONB destination column — the value-preserving
+                    // counterpart of writing it into TEXT. A string holding a
+                    // serialized JSON document is deliberately NOT parsed:
+                    // that conversion is explicit via the pw.Json column
+                    // type, and parsing here would silently turn "123" into
+                    // a number.
+                    if <serde_json::Value as ToSql>::accepts(ty) {
+                        let value = serde_json::Value::String(s.to_string());
+                        assert!(matches!(value.encode_format(ty), Format::Binary));
+                        return value.to_sql(ty, out);
+                    }
                     // PostgreSQL UUID binary layout is the raw 16
                     // bytes of the uuid. Parse the user's string here
                     // (accepting both canonical `xxxxxxxx-xxxx-…` and
