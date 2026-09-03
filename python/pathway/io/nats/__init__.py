@@ -89,8 +89,12 @@ def read(
             will be used as the name for the snapshot that stores the connector's progress.
         max_backlog_size: Limit on the number of entries read from the input source and kept
             in processing at any moment. Reading pauses when the limit is reached and resumes
-            as processing of some entries completes. Useful with large sources that
-            emit an initial burst of data to avoid memory spikes.
+            as processing of some entries completes. Set this whenever the source can deliver
+            data faster than the graph processes it — most importantly when a pipeline restarts
+            against a source that has accumulated a backlog (a stream replayed from the start,
+            a catch-up after downtime): without a limit the whole backlog is pulled into memory
+            at once and the process can be OOM-killed before it catches up. A few thousand to a
+            few tens of thousands is a reasonable starting point.
         debug_data: Static data replacing original one when debug mode is active.
 
     Returns:
