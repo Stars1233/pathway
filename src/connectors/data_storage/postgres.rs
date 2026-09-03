@@ -800,6 +800,15 @@ mod to_sql {
                 try_forward!(f64, Ok::<f64, std::convert::Infallible>(i as f64));
                 try_forward!(f32, Ok::<f32, std::convert::Infallible>(i as f32));
             }
+            // An i64 is by itself a valid JSON value, so a Pathway int
+            // has an unambiguous representation in a JSON / JSONB
+            // destination column.
+            if <serde_json::Value as ToSql>::accepts(ty) {
+                let value = serde_json::Value::from(i);
+                assert!(matches!(self.encode_format(ty), Format::Binary));
+                assert!(matches!(value.encode_format(ty), Format::Binary));
+                return Some(value.to_sql(ty, out));
+            }
             None
         }
 

@@ -87,6 +87,21 @@ fn test_int() {
     assert_success(Value::Int(-42), &Type::FLOAT4, -42.0f32);
     assert_success(Value::Int(42), &Type::FLOAT4, 42.0f32);
 
+    assert_success(Value::Int(-42), &Type::JSONB, serde_json::json!(-42));
+    assert_success(Value::Int(42), &Type::JSONB, serde_json::json!(42));
+    assert_success(
+        Value::Int(i64::MAX),
+        &Type::JSONB,
+        serde_json::json!(i64::MAX),
+    );
+    assert_success(
+        Value::Int(i64::MIN),
+        &Type::JSONB,
+        serde_json::json!(i64::MIN),
+    );
+    assert_success(Value::Int(-42), &Type::JSON, serde_json::json!(-42));
+    assert_success(Value::Int(42), &Type::JSON, serde_json::json!(42));
+
     assert_failure(Value::Int(42), &Type::TEXT);
 }
 
