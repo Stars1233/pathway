@@ -3318,6 +3318,55 @@ def test_earliest_and_latest_reducer():
     assert_stream_equality(res, expected)
 
 
+def test_latest_reducer_warns_on_not_append_only_input():
+    t = pw.debug.table_from_markdown(
+        """
+        a | b | __time__ | __diff__
+        1 | 2 |     2    |     1
+        1 | 2 |     4    |    -1
+        1 | 3 |     4    |     1
+        """
+    )
+    assert not t.is_append_only
+    with pytest.warns(
+        UserWarning,
+        match=r"the latest reducer requires an append-only input",
+    ):
+        t.groupby(pw.this.a).reduce(pw.this.a, latest=pw.reducers.latest(pw.this.b))
+
+
+def test_latest_reducer_no_warning_on_append_only_input():
+    t = pw.debug.table_from_markdown(
+        """
+        a | b
+        1 | 2
+        1 | 3
+        """
+    )
+    assert t.is_append_only
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        t.groupby(pw.this.a).reduce(pw.this.a, latest=pw.reducers.latest(pw.this.b))
+
+
+def test_latest_reducer_deletion_raises_keyed_error():
+    t = pw.debug.table_from_markdown(
+        """
+        a | b | __time__ | __diff__
+        1 | 2 |     2    |     1
+        1 | 2 |     4    |    -1
+        1 | 3 |     4    |     1
+        """
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        res = t.groupby(pw.this.a).reduce(
+            pw.this.a, latest=pw.reducers.latest(pw.this.b)
+        )
+    with pytest.raises(api.EngineError, match="append-only"):
+        pw.debug.compute_and_print(res)
+
+
 def test_earliest_and_latest_reducer_tie():
     t = T(
         """

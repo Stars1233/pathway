@@ -3595,9 +3595,10 @@ where
         self: Rc<Self>,
         values: &Collection<S, (Key, Key, Vec<Value>)>,
         _error_logger: Rc<dyn LogError>,
-        _trace: Trace,
+        trace: Trace,
         graph: &mut DataflowGraphInner<S>,
     ) -> Result<Values<S>> {
+        let error_reporter = graph.error_reporter.clone();
         Ok(values
             .map_named(
                 "LatestReducer::reduce::init",
@@ -3612,7 +3613,16 @@ where
                     let (_result_key, result_value) = values
                         .into_iter()
                         .map(|((key, values), diff)| {
-                            assert!(diff > 0, "deletion encountered in latest reducer");
+                            // The reducer keeps no state to fall back to, so a
+                            // deletion cannot be answered correctly - the input
+                            // is required to be append-only (also checked, as a
+                            // warning, at graph construction time).
+                            if diff <= 0 {
+                                error_reporter.report_and_panic_with_trace(
+                                    DataError::ExpectedAppendOnly(key),
+                                    &trace,
+                                );
+                            }
                             (key, values.into_iter().exactly_one().unwrap())
                         })
                         .max_by_key(|(key, _value)| *key)
@@ -3632,9 +3642,10 @@ where
         self: Rc<Self>,
         values: &Collection<S, (Key, Key, Vec<Value>)>,
         _error_logger: Rc<dyn LogError>,
-        _trace: Trace,
+        trace: Trace,
         graph: &mut DataflowGraphInner<S>,
     ) -> Result<Values<S>> {
+        let error_reporter = graph.error_reporter.clone();
         Ok(values
             .map_named(
                 "EarliestReducer::reduce::init",
@@ -3652,7 +3663,15 @@ where
                     let (_result_key, result_value) = values
                         .into_iter()
                         .map(|((key, values), diff)| {
-                            assert!(diff > 0, "deletion encountered in earliest reducer");
+                            // Same append-only requirement as in LatestReducer:
+                            // only the single earliest value is retained, so a
+                            // deletion cannot be answered correctly.
+                            if diff <= 0 {
+                                error_reporter.report_and_panic_with_trace(
+                                    DataError::ExpectedAppendOnly(key),
+                                    &trace,
+                                );
+                            }
                             (key, values.into_iter().exactly_one().unwrap())
                         })
                         .min_by_key(|(key, _value)| *key)
