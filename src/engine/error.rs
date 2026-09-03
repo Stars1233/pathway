@@ -4,6 +4,7 @@ use std::any::Any;
 use std::error;
 use std::fmt;
 use std::result;
+use std::sync::Mutex;
 
 use super::ColumnPath;
 use super::{Key, Value};
@@ -167,6 +168,31 @@ const OTHER_WORKER_ERROR_MESSAGES: [&str; 3] = [
     "Send thread panic: Any { .. }",
 ];
 
+/// The panic hook records the last panic's message and source location here
+/// and `from_panic_payload` reads it back. A panic's payload carries only the
+/// message, and by the time it is caught - often on the joining thread - the
+/// `PanicHookInfo` location is gone, yet that location is exactly what makes
+/// a reported worker panic actionable. Entries are matched by message so a
+/// concurrent panic on another thread cannot mislabel the location.
+static LAST_PANIC_LOCATION: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+fn record_panic_location(message: &str, location: &std::panic::Location) {
+    if let Ok(mut guard) = LAST_PANIC_LOCATION.lock() {
+        *guard = Some((message.to_string(), location.to_string()));
+    }
+}
+
+fn take_panic_location(message: &str) -> Option<String> {
+    let mut guard = LAST_PANIC_LOCATION.lock().ok()?;
+    match guard.take() {
+        Some((recorded_message, location)) if recorded_message == message => Some(location),
+        other => {
+            *guard = other;
+            None
+        }
+    }
+}
+
 impl Error {
     pub fn from_panic_payload(panic_payload: Box<dyn Any + Send + 'static>) -> Self {
         let message = match panic_payload.downcast::<&'static str>() {
@@ -179,6 +205,10 @@ impl Error {
         if OTHER_WORKER_ERROR_MESSAGES.contains(&message.as_str()) {
             Self::OtherWorkerPanic
         } else {
+            let message = match take_panic_location(&message) {
+                Some(location) => format!("{message} (panicked at {location})"),
+                None => message,
+            };
             Self::WorkerPanic(message)
         }
     }
@@ -388,8 +418,29 @@ pub fn register_custom_panic_hook() {
             Some(message) => Some(*message),
             None => payload.downcast_ref::<String>().map(String::as_str),
         };
+        if let (Some(message), Some(location)) = (message, panic_info.location()) {
+            record_panic_location(message, location);
+        }
         if message.is_none_or(|message| !OTHER_WORKER_ERROR_MESSAGES.contains(&message)) {
             prev(panic_info);
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{register_custom_panic_hook, Error};
+
+    #[test]
+    fn worker_panic_message_carries_the_panic_location() {
+        register_custom_panic_hook();
+        let payload = std::panic::catch_unwind(|| panic!("test panic for location capture"))
+            .expect_err("the closure must panic");
+        let message = Error::from_panic_payload(payload).to_string();
+        assert!(
+            message.contains("test panic for location capture"),
+            "{message}"
+        );
+        assert!(message.contains("error.rs:"), "{message}");
+    }
 }
