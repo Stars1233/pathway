@@ -934,6 +934,7 @@ class PsqlReplicationSettings:
 
 class DataStorage:
     mode: ConnectorMode
+    def emits_source_completion(self) -> bool: ...
     def __init__(
         self,
         storage_type: str,

@@ -275,6 +275,9 @@ def read(
         autocommit_duration_ms: The maximum time between two commits. Every
             ``autocommit_duration_ms`` milliseconds, the updates received by the
             connector are committed and pushed into Pathway's computation graph.
+            Required for streaming reads: a Pulsar topic never signals completion, so
+            the timer is the only thing that advances time; ``None`` is rejected at
+            construction.
         json_field_paths: If the format is ``"json"``, this field allows to map field
             names into path in the read json object. For the field which require such
             mapping, it should be given in the format ``<field_name>: <path to be

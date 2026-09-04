@@ -5195,3 +5195,17 @@ def test_deltalake_table_optimizer_rejects_invalid_durations():
             compression_frequency=datetime.timedelta(days=1),
             retention_period=-1,
         )
+
+
+def test_streaming_queue_reader_requires_commit_timer(tmp_path):
+    # A message-queue reader never signals that its source is exhausted, so
+    # without an auto-commit timer nothing would ever be committed and the
+    # pipeline would run forever without emitting a row. It must fail at
+    # construction instead of starting.
+    settings = {"bootstrap.servers": "localhost:9092", "group.id": "group"}
+    with pytest.raises(ValueError, match="autocommit_duration_ms=None"):
+        pw.io.kafka.read(
+            settings, topic="topic", format="raw", autocommit_duration_ms=None
+        )
+    # a file source finishes on its own, so it may run without the timer
+    pw.io.fs.read(tmp_path, format="plaintext", autocommit_duration_ms=None)

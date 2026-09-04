@@ -80,6 +80,9 @@ def read(
             ``"streaming"`` mode, the connector reads messages continuously. In
             ``"static"`` mode, it reads all existing messages and then stops.
         autocommit_duration_ms: The time interval (in milliseconds) between commits.
+            Required for streaming reads: a RabbitMQ queue never signals completion, so
+            the timer is the only thing that advances time; ``None`` is rejected at
+            construction.
             After this time, the updates received by the connector are committed and
             added to Pathway Live Data Framework's computation graph.
         json_field_paths: For the ``"json"`` format, this allows mapping field names to

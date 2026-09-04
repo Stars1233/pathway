@@ -6374,6 +6374,17 @@ impl DataStorage {
         })
     }
 
+    /// Whether the reader ever reports `ReadResult::FinishedSource` in the
+    /// streaming mode. Message queues have no notion of an exhausted source,
+    /// so their readers never do - the only thing that advances time for
+    /// them is the auto-commit timer.
+    fn emits_source_completion(&self) -> bool {
+        !matches!(
+            self.storage_type.as_ref(),
+            "kafka" | "nats" | "mqtt" | "rabbitmq" | "pulsar" | "kinesis"
+        )
+    }
+
     #[pyo3(signature = ())]
     fn delta_s3_storage_options(&self) -> PyResult<HashMap<String, String>> {
         let (bucket_name, _) = S3Scanner::deduce_bucket_and_path(self.path()?);
