@@ -6,6 +6,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Changed
+- Two previously context-free error messages are now actionable: filesystem persistence backend errors include the offending path (`persistence backend failed: /state/dir/key: Permission denied` instead of a bare `Permission denied (os error 13)`), and the date-time conversion error names the value and the timezone that could not represent it.
 - `pw.reducers.latest` and `pw.reducers.earliest` now report a keyed error with the operator's trace when a deletion reaches them (their input is required to be append-only), instead of a bare worker panic. A warning is also emitted at graph construction time when the reducer's input is not statically append-only; `assert_append_only()` records the promise and silences it.
 - **BREAKING**: `pw.io.mqtt.read` with persistence enabled and `qos` 1 or 2 now requires a stable `client_id` in the connection URI and fails at construction without one. Previously such a pipeline started, but silently lost messages on restart.
 - With persistence enabled, the MQTT broker must be able to buffer a checkpoint window of unacknowledged and queued messages per client (for Mosquitto: `max_inflight_messages`, `max_queued_messages`). Default broker limits may throttle throughput.

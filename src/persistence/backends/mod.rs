@@ -36,6 +36,13 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] IoError),
 
+    #[error("{}: {error}", path.display())]
+    IoWithPath {
+        path: std::path::PathBuf,
+        #[source]
+        error: IoError,
+    },
+
     #[error(transparent)]
     S3(#[from] S3Error),
 

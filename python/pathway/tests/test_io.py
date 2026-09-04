@@ -1147,7 +1147,9 @@ def test_no_pstorage(tmp_path: pathlib.Path):
     pw.io.csv.write(table, output_path)
     with pytest.raises(
         api.EngineError,
-        match="persistence backend failed: target object should be a directory",
+        # the backend error carries the offending path between the prefix
+        # and the reason
+        match="persistence backend failed: .*target object should be a directory",
     ):
         run(
             persistence_config=pw.persistence.Config(

@@ -335,8 +335,8 @@ pub enum DataError {
     #[error("parse error: {0}")]
     ParseError(String),
 
-    #[error("date time conversion error")]
-    DateTimeConversionError,
+    #[error("cannot convert date time {value} in timezone {timezone:?}: this local time does not exist in that timezone")]
+    DateTimeConversionError { value: String, timezone: String },
 
     #[error("Error value in column")]
     ErrorInValue,
