@@ -42,6 +42,15 @@ use crate::persistence::frontier::OffsetAntichain;
 use crate::python_api::ValueField;
 use crate::retry::execute_with_retries_if;
 
+/// `PostGIS` `geometry` / `geography` are extension types without a static
+/// `Type` constant, so they are matched by name. The `Kind::Simple` guard
+/// keeps user-defined ENUM / composite types that happen to carry the same
+/// name on their own code paths.
+fn is_postgis_type(ty: &PgType) -> bool {
+    matches!(ty.kind(), postgres::types::Kind::Simple)
+        && matches!(ty.name(), "geometry" | "geography")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SslError {
     #[error(transparent)]
@@ -568,12 +577,15 @@ mod to_sql {
 
     use bytes::{BufMut, BytesMut};
     use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+    use geozero::{wkt::Wkt, CoordDimensions, ToWkb};
     use half::f16;
     use ndarray::ArrayD;
     use numpy::Ix1;
     use ordered_float::OrderedFloat;
     use pgvector::{HalfVector, Vector};
     use postgres::types::{to_sql_checked, Format, IsNull, ToSql, Type};
+    use wkt::types::{Coord, Point as WktPoint};
+    use wkt::Wkt as ParsedWkt;
 
     use crate::engine::time::DateTime as _;
     use crate::engine::Value;
@@ -897,6 +909,180 @@ mod to_sql {
         }
     }
 
+    /// The coordinate dimensions found in a parsed WKT geometry, as
+    /// `(has_z, has_m)`, or `None` for a geometry without coordinates.
+    /// Every coordinate has to agree - `PostGIS` rejects a geometry that
+    /// mixes dimensionalities, so a mismatch (e.g. `GEOMETRYCOLLECTION Z`
+    /// with a 2D member) is an error rather than a zero-filled coordinate.
+    /// Empty points nested in a collection are rejected as well: the WKB
+    /// writer has no representation for them and would emit a member
+    /// count the payload does not match.
+    fn wkt_coordinate_dimensions(
+        geometry: &ParsedWkt<f64>,
+    ) -> Result<Option<(bool, bool)>, String> {
+        fn record(coord: &Coord<f64>, dims: &mut Option<(bool, bool)>) -> Result<(), String> {
+            let coord_dims = (coord.z.is_some(), coord.m.is_some());
+            match dims {
+                Some(seen) if *seen != coord_dims => {
+                    Err("mixed coordinate dimensions in a geometry".to_string())
+                }
+                _ => {
+                    *dims = Some(coord_dims);
+                    Ok(())
+                }
+            }
+        }
+        fn point(point: &WktPoint<f64>, dims: &mut Option<(bool, bool)>) -> Result<(), String> {
+            match &point.0 {
+                Some(coord) => record(coord, dims),
+                None => Err("empty points inside a collection are not supported".to_string()),
+            }
+        }
+        fn visit(geometry: &ParsedWkt<f64>, dims: &mut Option<(bool, bool)>) -> Result<(), String> {
+            match geometry {
+                ParsedWkt::Point(p) => point(p, dims),
+                ParsedWkt::LineString(l) => l.0.iter().try_for_each(|c| record(c, dims)),
+                ParsedWkt::Polygon(p) => {
+                    p.0.iter()
+                        .flat_map(|l| l.0.iter())
+                        .try_for_each(|c| record(c, dims))
+                }
+                ParsedWkt::MultiPoint(m) => m.0.iter().try_for_each(|p| point(p, dims)),
+                ParsedWkt::MultiLineString(m) => {
+                    m.0.iter()
+                        .flat_map(|l| l.0.iter())
+                        .try_for_each(|c| record(c, dims))
+                }
+                ParsedWkt::MultiPolygon(m) => {
+                    m.0.iter()
+                        .flat_map(|p| p.0.iter())
+                        .flat_map(|l| l.0.iter())
+                        .try_for_each(|c| record(c, dims))
+                }
+                ParsedWkt::GeometryCollection(g) => g.0.iter().try_for_each(|m| visit(m, dims)),
+            }
+        }
+        let mut dims = None;
+        match geometry {
+            // A top-level empty point is fine (see `empty_point_ewkb`).
+            ParsedWkt::Point(WktPoint(None)) => {}
+            _ => visit(geometry, &mut dims)?,
+        }
+        Ok(dims)
+    }
+
+    /// The dimensions declared in the WKT header, used for geometries
+    /// without coordinates (`LINESTRING Z EMPTY`), where the coordinates
+    /// cannot tell. The `Z` / `M` / `ZM` token follows the type keyword,
+    /// either separated by whitespace (`POINT ZM (...)`) or glued to it
+    /// (`POINTZM(...)`); squashing the whitespace makes both spellings
+    /// alike, and no WKT type name ends with `Z` or `M`.
+    fn wkt_header_dimensions(wkt: &str) -> (bool, bool) {
+        let head: String = wkt[..wkt.find('(').unwrap_or(wkt.len())]
+            .split_whitespace()
+            .collect::<String>()
+            .to_uppercase();
+        let head = head.strip_suffix("EMPTY").unwrap_or(&head);
+        if head.ends_with("ZM") {
+            (true, true)
+        } else if head.ends_with('Z') {
+            (true, false)
+        } else if head.ends_with('M') {
+            (false, true)
+        } else {
+            (false, false)
+        }
+    }
+
+    /// `POINT EMPTY` in EWKB, the way `PostGIS` encodes it: a point whose
+    /// coordinates are all NaN. `geozero` cannot write empty points.
+    fn empty_point_ewkb(dims: CoordDimensions, srid: Option<i32>) -> Vec<u8> {
+        let mut out = vec![0x01]; // little-endian
+        let mut type_with_flags: u32 = 1; // POINT
+        if dims.z {
+            type_with_flags |= 0x8000_0000;
+        }
+        if dims.m {
+            type_with_flags |= 0x4000_0000;
+        }
+        if srid.is_some() {
+            type_with_flags |= 0x2000_0000;
+        }
+        out.extend_from_slice(&type_with_flags.to_le_bytes());
+        if let Some(srid) = srid {
+            out.extend_from_slice(&srid.to_le_bytes());
+        }
+        let n_coords = 2 + usize::from(dims.z) + usize::from(dims.m);
+        for _ in 0..n_coords {
+            out.extend_from_slice(&f64::NAN.to_le_bytes());
+        }
+        out
+    }
+
+    /// Converts the textual geometry representations users keep in `str`
+    /// columns into EWKB — the binary wire format `PostGIS` expects for
+    /// `geometry` / `geography` values. Accepts hex-encoded (E)WKB
+    /// (the canonical `PostgreSQL` output format, so values read from a
+    /// `PostGIS` column can be written back verbatim) and (E)WKT,
+    /// optionally with an `SRID=n;` prefix.
+    fn ewkb_from_string(s: &str) -> Result<Vec<u8>, String> {
+        let s = s.trim();
+        // A hex-encoded (E)WKB payload starts with the byte-order marker
+        // (`00` big-endian / `01` little-endian). No WKT keyword starts
+        // with a digit, so the prefix alone tells the two forms apart, and
+        // a damaged payload gets the hex decoder's own diagnostics.
+        if s.starts_with("00") || s.starts_with("01") {
+            return hex::decode(s).map_err(|e| format!("malformed hex EWKB: {e}"));
+        }
+        // The EWKT `SRID=n;` prefix; PostGIS matches the keyword
+        // case-insensitively.
+        let (srid, wkt) = match s.get(..5) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("srid=") => {
+                let (srid, wkt) = s[5..]
+                    .split_once(';')
+                    .ok_or("expected ';' after the SRID prefix of a WKT geometry")?;
+                let srid: i32 = srid
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("malformed SRID '{srid}': {e}"))?;
+                (Some(srid), wkt.trim())
+            }
+            _ => (None, s),
+        };
+        // `geozero` needs the coordinate dimensions up front and silently
+        // drops whatever the requested dimensions leave out, so they are
+        // taken from the parsed coordinates themselves (`POINTZ(1 2 3)`
+        // and `POINT Z (1 2 3)` alike), falling back to the header for
+        // empty geometries.
+        let parsed: ParsedWkt<f64> = wkt
+            .parse()
+            .map_err(|e| format!("cannot parse WKT geometry: {e}"))?;
+        let (header_z, header_m) = wkt_header_dimensions(wkt);
+        let (has_z, has_m) = wkt_coordinate_dimensions(&parsed)
+            .map_err(|e| format!("cannot parse WKT geometry: {e}"))?
+            .unwrap_or((header_z, header_m));
+        // A header that declares Z / M while the coordinates lack it
+        // (`GEOMETRYCOLLECTION Z (POINT(1 2))`) is a mixed-dimension
+        // geometry, which PostGIS rejects too.
+        if (header_z && !has_z) || (header_m && !has_m) {
+            return Err(
+                "cannot parse WKT geometry: mixed coordinate dimensions in a geometry".to_string(),
+            );
+        }
+        let dims = CoordDimensions {
+            z: has_z,
+            m: has_m,
+            t: false,
+            tm: false,
+        };
+        if let ParsedWkt::Point(WktPoint(None)) = parsed {
+            return Ok(empty_point_ewkb(dims, srid));
+        }
+        Wkt(wkt)
+            .to_ewkb(dims, srid)
+            .map_err(|e| format!("cannot parse WKT geometry: {e}"))
+    }
+
     impl ToSql for Value {
         #[allow(clippy::too_many_lines)]
         fn to_sql(
@@ -965,6 +1151,13 @@ mod to_sql {
                     "pointer"
                 }
                 Self::String(s) => {
+                    // PostGIS ``geometry`` / ``geography``: the binary wire
+                    // format is EWKB; see `ewkb_from_string` for the
+                    // accepted textual forms.
+                    if super::is_postgis_type(ty) {
+                        out.extend_from_slice(&ewkb_from_string(s)?);
+                        return Ok(IsNull::No);
+                    }
                     // A Pathway string maps to the JSON *string* value in a
                     // JSON / JSONB destination column — the value-preserving
                     // counterpart of writing it into TEXT. A string holding a
@@ -2555,6 +2748,14 @@ mod from_sql {
                 return parse_binary_array(elem_type, raw);
             }
 
+            // PostGIS ``geometry`` / ``geography``: the binary payload is
+            // EWKB. Expose it in its canonical textual form — hex — which
+            // both PostgreSQL itself and the Pathway writer accept back
+            // verbatim.
+            if super::is_postgis_type(ty) {
+                return Ok(Value::String(hex::encode_upper(raw).into()));
+            }
+
             Err(Box::new(FromSqlError::UnsupportedPostgresType {
                 postgres_type: ty.clone(),
             }))
@@ -3748,7 +3949,7 @@ pub enum CompatDirection {
 /// reject an `INSERT` whose serialization would fail at flush
 /// because the destination column is of an incompatible type).
 ///
-/// Mirror of the read-side mapping described in `360.postgres.rst`.
+/// Mirror of the read-side mapping described in `370.postgres.rst`.
 /// This is a scalar-only check — container types (ARRAY, custom
 /// DOMAIN / ENUM / extensions like `pgvector`) fall through to
 /// `permissive = true` because the runtime `ToSql` / `FromSql`
@@ -3807,11 +4008,16 @@ fn is_pathway_type_compatible_with_pg_udt(
     // Arrays (both built-in like `_int4` and pgvector's `vector`/`halfvec`)
     // and any non-standard udt_name (custom domains / enums) are
     // permitted unconditionally — the runtime parser validates them.
+    // PostGIS ``geometry`` / ``geography`` are the exception among the
+    // extension types: only ``str`` can be serialized into them, so they
+    // go through the per-type match below like the built-ins.
     let looks_like_custom_or_array = actual_udt.starts_with('_')
         || matches!(actual_udt, "vector" | "halfvec")
         || !matches!(
             actual_udt,
-            "bool"
+            "geometry"
+                | "geography"
+                | "bool"
                 | "int2"
                 | "int4"
                 | "int8"
@@ -3872,6 +4078,8 @@ fn is_pathway_type_compatible_with_pg_udt(
                 | "cidr"
                 | "macaddr"
                 | "macaddr8"
+                | "geometry"
+                | "geography"
         ),
         Type::Pointer => actual_udt == "text",
         Type::Bytes | Type::PyObjectWrapper => actual_udt == "bytea",

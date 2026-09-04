@@ -327,6 +327,10 @@ def read(
 
         CREATE PUBLICATION {publication_name} FOR TABLE {table_name};
 
+    PostGIS ``geometry`` and ``geography`` columns are read into ``str`` columns as
+    hex-encoded EWKB — the canonical PostgreSQL output format. Such strings can be
+    passed back to ``pw.io.postgres.write`` verbatim, which also accepts WKT.
+
     Args:
         postgres_settings: Connection parameters for PostgreSQL, provided as a
             dictionary of key-value pairs. The connection string is assembled by joining
@@ -632,6 +636,14 @@ def write(
 
     When using **snapshot**, the set of columns in the output table matches the set of
     columns in the table you are writing. No additional columns are created.
+
+    PostGIS ``geometry`` and ``geography`` columns are written from ``str`` columns:
+    the value can be either WKT (e.g. ``"POINT(30.5 59.9)"`` or ``"POINT Z (1 2 3)"``,
+    optionally with an ``"SRID=4326;"`` prefix) or hex-encoded EWKB — the canonical
+    PostgreSQL output format, which is also what ``pw.io.postgres.read`` produces for
+    such columns, so geometry values round-trip verbatim. The destination table has to
+    exist already (``init_mode="default"``): the connector cannot create PostGIS
+    columns itself.
 
     Args:
         table: Table to be written.
